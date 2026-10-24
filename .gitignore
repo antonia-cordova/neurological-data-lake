@@ -1,0 +1,52 @@
+﻿# Environment variables and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Raw and processed datasets
+data/source/*
+data/bronze/*
+data/silver/*
+data/gold/*
+data/platinum/*
+!data/source/.gitkeep
+!data/bronze/.gitkeep
+!data/silver/.gitkeep
+!data/gold/.gitkeep
+!data/platinum/.gitkeep
+
+# Data and database artifacts
+*.csv
+*.parquet
+*.xpt
+*.sas7bdat
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs and temporary files
+*.log
+tmp/
+temp/
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
