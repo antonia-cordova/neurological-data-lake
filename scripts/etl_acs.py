@@ -4,12 +4,10 @@ import argparse
 import logging
 import os
 from pathlib import Path
-
 import pandas as pd
 from dotenv import load_dotenv
 from sqlalchemy import URL, create_engine, text
 from sqlalchemy.engine import Engine
-
 from silver_budget import enforce_silver_budget, lock_silver_budget
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -104,7 +102,7 @@ def validate_source_file(source_file: Path) -> pd.DataFrame:
         )
 
     # Se conserva literalmente la etiqueta, incluidos posibles espacios
-    # iniciales que pueden representar jerarquía visual en el documento ACS.
+    # iniciales que pueden representar jerarquía visual en el documento ACS
     if df["Label (Grouping)"].str.strip().eq("").any():
         bad_rows = df.index[df["Label (Grouping)"].str.strip().eq("")].tolist()[:10]
         raise ValueError(f"Etiquetas vacías. Índices de ejemplo: {bad_rows}")

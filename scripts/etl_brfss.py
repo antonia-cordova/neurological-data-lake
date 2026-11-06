@@ -242,7 +242,7 @@ def sample_source() -> tuple[pd.DataFrame, int]:
                 selected_frames.append(part.sort_values("_sample_hash").head(quota))
 
     candidates = pd.concat(selected_frames, ignore_index=True)
-    # La selección de cada estado se vuelve a limitar tras combinar bloques.
+    # La selección de cada estado se vuelve a limitar tras combinar bloques
     pieces = []
     for state, quota in allocation.items():
         part = candidates.loc[candidates["_STATE"].eq(state)]

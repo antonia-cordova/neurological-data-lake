@@ -229,7 +229,7 @@ def transform_and_sample(source: Path, run_id: int) -> tuple[pd.DataFrame, int, 
         )
 
     result["data_value"] = data_value_numeric
-    result["run_id"] = run_id  # solo auditoría durante el proceso; no se persiste como columna.
+    result["run_id"] = run_id  # solo auditoría durante el proceso; no se persiste como columna
     return result, source_rows, year_rows
 
 
@@ -300,16 +300,13 @@ def run_etl(replace: bool = False) -> None:
 
         with engine.begin() as conn:
 
-    # Protege el presupuesto global de Silver
             lock_silver_budget(conn)
 
-            # Comprueba si existen registros previamente cargados
             existing_rows = int(conn.execute(text("""
                 SELECT COUNT(*)
                 FROM public.silver_places_2023
             """)).scalar_one())
 
-            # Impide sobrescribir datos si no se solicitó explícitamente
             if existing_rows > 0 and not replace:
                 raise RuntimeError(
                     f"La tabla {TARGET_TABLE} ya contiene {existing_rows} registros. "
@@ -317,7 +314,6 @@ def run_etl(replace: bool = False) -> None:
                     "Para reemplazarlos, ejecuta el ETL con --replace."
                 )
 
-            # Elimina los registros únicamente con --replace
             if existing_rows > 0 and replace:
                 logger.warning(
                     "Se reemplazarán %s registros existentes de PLACES.",

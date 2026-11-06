@@ -32,7 +32,6 @@ data/platinum/*
 !data/platinum/.gitkeep
 
 # Data and database artifacts
-*.csv
 *.parquet
 *.xpt
 *.sas7bdat
