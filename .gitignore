@@ -49,3 +49,15 @@ temp/
 .idea/
 .DS_Store
 Thumbs.db
+
+
+# Gold: archivos históricos y temporales
+sql/gold/migrations/
+sql/gold/archive/
+sql/gold/*_temp.sql
+sql/gold/extend_geography
+scripts/migrate_gold.py
+
+# Respaldos SQL locales
+*_backup.sql
+health_datalake_dev_backup.dump
