@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import argparse
 import hashlib
 import logging
@@ -11,10 +10,10 @@ import pandas as pd
 from dotenv import load_dotenv
 from sqlalchemy import URL, create_engine, text
 from sqlalchemy.engine import Engine
-
-
-from silver_budget import enforce_silver_budget, lock_silver_budget
-
+from scripts.silver_budget import (
+    enforce_silver_budget,
+    lock_silver_budget,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 BRONZE_DIR = ROOT / "data" / "bronze" / "places_2025"
@@ -31,8 +30,16 @@ SELECTED_MEASURE_IDS = frozenset({
 })
 
 TARGET_COLUMNS = [
-    "state_abbr", "location_name", "location_id", "measure",
-    "measure_id", "data_value_type", "data_value", "latitude", "longitude",
+    "state_abbr",
+    "location_name",
+    "location_id",
+    "measure",
+    "measure_id",
+    "data_value_type",
+    "data_value",
+    "latitude",
+    "longitude",
+    "run_id",
 ]
 
 GEO_PATTERN = re.compile(
@@ -48,16 +55,24 @@ logger = logging.getLogger("etl_places")
 
 
 def create_db_engine() -> Engine:
+    load_dotenv(ROOT / ".env", override=False)
 
-    load_dotenv(ROOT / ".env")
+    allowed_database = "health_datalake"
+    database = os.getenv("POSTGRES_DB")
+
+    if database != allowed_database:
+        raise RuntimeError(
+            f"Conexión rechazada: solo se permite '{allowed_database}'. "
+            f"Base configurada: {database!r}"
+        )
 
     required = ["POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"]
-
     missing = [name for name in required if not os.getenv(name)]
 
     if missing:
-
-        raise RuntimeError(f"Faltan variables en .env: {', '.join(missing)}")
+        raise RuntimeError(
+            f"Faltan variables de conexión: {', '.join(missing)}"
+        )
 
     url = URL.create(
         "postgresql+psycopg",
@@ -65,8 +80,32 @@ def create_db_engine() -> Engine:
         password=os.environ["POSTGRES_PASSWORD"],
         host=os.getenv("POSTGRES_HOST", "localhost"),
         port=int(os.getenv("POSTGRES_PORT", "5432")),
-        database=os.environ["POSTGRES_DB"],)
-    return create_engine(url, pool_pre_ping=True)
+        database=database,
+    )
+
+    engine = create_engine(
+        url,
+        pool_pre_ping=True,
+        connect_args={"connect_timeout": 5},
+    )
+
+    try:
+        with engine.connect() as conn:
+            actual_database = conn.execute(
+                text("SELECT current_database()")
+            ).scalar_one()
+
+            if actual_database != allowed_database:
+                raise RuntimeError(
+                    f"Conexión rechazada: PostgreSQL respondió "
+                    f"con la base '{actual_database}'."
+                )
+
+        return engine
+
+    except Exception:
+        engine.dispose()
+        raise
 
 
 def find_source_file() -> Path:
@@ -244,15 +283,16 @@ def validate_target_schema(engine: Engine) -> None:
         """), {"table_name": TARGET_TABLE}).mappings().all()
 
     expected = {
-        "state_abbr": ("text", "YES"),
-        "location_name": ("text", "YES"),
-        "location_id": ("text", "NO"),
-        "measure": ("text", "YES"),
-        "measure_id": ("text", "NO"),
-        "data_value_type": ("text", "NO"),
-        "data_value": ("numeric", "YES"),
-        "latitude": ("double precision", "YES"),
-        "longitude": ("double precision", "YES"),
+    "state_abbr": ("text", "YES"),
+    "location_name": ("text", "YES"),
+    "location_id": ("text", "NO"),
+    "measure": ("text", "YES"),
+    "measure_id": ("text", "NO"),
+    "data_value_type": ("text", "NO"),
+    "data_value": ("numeric", "YES"),
+    "latitude": ("double precision", "YES"),
+    "longitude": ("double precision", "YES"),
+    "run_id": ("bigint", "NO"),
     }
 
     actual = {r["column_name"]: (r["data_type"], r["is_nullable"]) for r in rows}
@@ -327,13 +367,33 @@ def run_etl(replace: bool = False) -> None:
             payload = transformed[TARGET_COLUMNS].to_dict(orient="records")
 
             insert_stmt = text("""
-                INSERT INTO public.silver_places_2023
-                    (state_abbr, location_name, location_id, measure, measure_id,
-                     data_value_type, data_value, latitude, longitude)
-                VALUES
-                    (:state_abbr, :location_name, :location_id, :measure, :measure_id,
-                     :data_value_type, :data_value, :latitude, :longitude)
-            """)
+            INSERT INTO public.silver_places_2023
+                (
+                    state_abbr,
+                    location_name,
+                    location_id,
+                    measure,
+                    measure_id,
+                    data_value_type,
+                    data_value,
+                    latitude,
+                    longitude,
+                    run_id
+                )
+            VALUES
+                (
+                    :state_abbr,
+                    :location_name,
+                    :location_id,
+                    :measure,
+                    :measure_id,
+                    :data_value_type,
+                    :data_value,
+                    :latitude,
+                    :longitude,
+                    :run_id
+                )
+                """)
 
             for start in range(0, len(payload), INSERT_BATCH_SIZE):
                 batch = payload[start:start + INSERT_BATCH_SIZE]
@@ -355,7 +415,39 @@ def run_etl(replace: bool = False) -> None:
                     f"Persistidos={persisted}; cargados={loaded_rows}."
                 )
 
+            # Validar trazabilidad de todos los registros Silver.
+            lineage = conn.execute(text("""
+                SELECT
+                    COUNT(*) AS total_rows,
+                    COUNT(run_id) AS rows_with_run_id,
+                    COUNT(DISTINCT run_id) AS distinct_runs,
+                    MIN(run_id) AS min_run_id,
+                    MAX(run_id) AS max_run_id
+                FROM public.silver_places_2023
+            """)).mappings().one()
+
+            if (
+                lineage["total_rows"] != loaded_rows
+                or lineage["rows_with_run_id"] != loaded_rows
+                or lineage["distinct_runs"] != 1
+                or lineage["min_run_id"] != run_id
+                or lineage["max_run_id"] != run_id
+            ):
+                raise RuntimeError(
+                    "Trazabilidad PLACES inconsistente. "
+                    f"Esperado run_id={run_id}; "
+                    f"resultado={dict(lineage)}"
+                )
+
+            logger.info(
+                "Trazabilidad Silver validada | run_id=%s | filas=%s",
+                run_id,
+                lineage["rows_with_run_id"],
+            )
+
             total_cells = enforce_silver_budget(conn)
+
+
 
             conn.execute(text("""
                 UPDATE public.etl_runs
@@ -404,6 +496,8 @@ def run_etl(replace: bool = False) -> None:
 
             except Exception:
                 logger.exception("No se pudo actualizar etl_runs.")
+
+            
 
         raise
 

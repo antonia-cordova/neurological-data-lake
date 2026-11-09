@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import argparse
 import logging
 import os
@@ -8,7 +7,10 @@ import pandas as pd
 from dotenv import load_dotenv
 from sqlalchemy import URL, create_engine, text
 from sqlalchemy.engine import Engine
-from silver_budget import enforce_silver_budget, lock_silver_budget
+from scripts.silver_budget import (
+    enforce_silver_budget,
+    lock_silver_budget,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_DIR = ROOT / "data" / "bronze" / "acs_2024"
@@ -60,12 +62,26 @@ def locate_source_file(explicit_path: str | None = None) -> Path:
     return candidates[0]
 
 
+
 def create_db_engine() -> Engine:
-    load_dotenv(ROOT / ".env")
+    load_dotenv(ROOT / ".env", override=False)
+
+    allowed_database = "health_datalake"
+    database = os.getenv("POSTGRES_DB")
+
+    if database != allowed_database:
+        raise RuntimeError(
+            f"Conexión rechazada: solo se permite '{allowed_database}'. "
+            f"Base configurada: {database!r}"
+        )
+
     required = ["POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"]
     missing = [key for key in required if not os.getenv(key)]
+
     if missing:
-        raise RuntimeError(f"Faltan variables en .env: {', '.join(missing)}")
+        raise RuntimeError(
+            f"Faltan variables de conexión: {', '.join(missing)}"
+        )
 
     url = URL.create(
         "postgresql+psycopg",
@@ -73,10 +89,32 @@ def create_db_engine() -> Engine:
         password=os.environ["POSTGRES_PASSWORD"],
         host=os.getenv("POSTGRES_HOST", "localhost"),
         port=int(os.getenv("POSTGRES_PORT", "5432")),
-        database=os.environ["POSTGRES_DB"],
+        database=database,
     )
-    return create_engine(url, pool_pre_ping=True)
 
+    engine = create_engine(
+        url,
+        pool_pre_ping=True,
+        connect_args={"connect_timeout": 5},
+    )
+
+    try:
+        with engine.connect() as conn:
+            actual_database = conn.execute(
+                text("SELECT current_database()")
+            ).scalar_one()
+
+            if actual_database != allowed_database:
+                raise RuntimeError(
+                    f"Conexión rechazada: PostgreSQL respondió "
+                    f"con la base '{actual_database}'."
+                )
+
+        return engine
+
+    except Exception:
+        engine.dispose()
+        raise
 
 def validate_source_file(source_file: Path) -> pd.DataFrame:
     # Se conservan como texto los símbolos ACS: *****, (X), ±, comas y %.

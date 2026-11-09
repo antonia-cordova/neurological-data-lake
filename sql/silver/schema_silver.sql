@@ -1,9 +1,3 @@
--- ============================================================
--- SILVER SCHEMA
--- Neurological Data Lake
--- PostgreSQL 17
--- ============================================================
-
 CREATE TABLE IF NOT EXISTS public.etl_runs (
     run_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     dataset_name TEXT NOT NULL,
@@ -25,10 +19,9 @@ CREATE INDEX IF NOT EXISTS idx_etl_runs_dataset_started
 CREATE INDEX IF NOT EXISTS idx_etl_runs_status
     ON public.etl_runs (status);
 
-
 -- ============================================================
 -- PLACES 2023
--- 9 physical columns
+-- 10 physical columns (9 data + 1 lineage)
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS public.silver_places_2023 (
@@ -41,6 +34,8 @@ CREATE TABLE IF NOT EXISTS public.silver_places_2023 (
     data_value NUMERIC,
     latitude DOUBLE PRECISION,
     longitude DOUBLE PRECISION,
+    run_id BIGINT NOT NULL
+        REFERENCES public.etl_runs(run_id),
 
     CONSTRAINT silver_places_2023_pkey
         PRIMARY KEY (location_id, measure_id, data_value_type)
@@ -51,6 +46,9 @@ CREATE INDEX IF NOT EXISTS idx_silver_places_2023_location
 
 CREATE INDEX IF NOT EXISTS idx_silver_places_2023_measure
     ON public.silver_places_2023 (measure_id);
+
+CREATE INDEX IF NOT EXISTS idx_silver_places_2023_run_id
+    ON public.silver_places_2023 (run_id);
 
 
 -- ============================================================
@@ -76,7 +74,6 @@ CREATE INDEX IF NOT EXISTS idx_silver_brfss_2023_state
 CREATE INDEX IF NOT EXISTS idx_silver_brfss_2023_record_data
     ON public.silver_brfss_2023 USING GIN (record_data);
 
-
 -- ============================================================
 -- ACS 2024
 -- 7 physical columns
@@ -96,7 +93,10 @@ CREATE TABLE IF NOT EXISTS public.silver_acs_2024 (
 CREATE INDEX IF NOT EXISTS idx_silver_acs_2024_label
     ON public.silver_acs_2024 (label_grouping);
 
+CREATE INDEX IF NOT EXISTS idx_silver_acs_2024_run_id
+    ON public.silver_acs_2024 (run_id);
 
+    
 -- ============================================================
 -- DOCUMENTATION
 -- ============================================================
@@ -105,7 +105,7 @@ COMMENT ON TABLE public.etl_runs IS
     'Audit log for dataset ETL executions. One row per execution.';
 
 COMMENT ON TABLE public.silver_places_2023 IS
-    'Compact PLACES 2023 Silver dataset.';
+    'Compact PLACES 2023 Silver dataset with ETL run-level lineage.';
 
 COMMENT ON TABLE public.silver_brfss_2023 IS
     'BRFSS 2023 sample. Selected variables stored in JSONB.';
