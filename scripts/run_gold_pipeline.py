@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 from sqlalchemy import text
-from scripts.etl_gold_places import create_db_engine
+from scripts.gold.etl_gold_places import create_db_engine
 
 ROOT = Path(__file__).resolve().parents[1]
 

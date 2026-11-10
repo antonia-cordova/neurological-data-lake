@@ -12,7 +12,7 @@ import requests
 from dotenv import load_dotenv
 from sqlalchemy import URL, create_engine, text
 from sqlalchemy.engine import Engine
-from scripts.silver_budget import (
+from scripts.silver.silver_budget import (
     enforce_silver_budget,
     lock_silver_budget,
 )

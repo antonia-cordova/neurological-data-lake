@@ -1,0 +1,4 @@
+﻿level,database,rate_accuracy,rate_completeness,rate_semantic_consistency,tables_in_scope,source_rows_total,planned_operations,unique_cells,planned_changes_total,dimension,rules,eligible_cells,planned_changes,partial_or_skipped_rules
+medium,health_datalake_medium,0.05,0.05,0.05,22,67587,4584,4584,4584,accuracy,16,23548,951,6
+medium,health_datalake_medium,0.05,0.05,0.05,22,67587,4584,4584,4584,completeness,16,70082,3505,1
+medium,health_datalake_medium,0.05,0.05,0.05,22,67587,4584,4584,4584,semantic_consistency,5,2555,128,0

@@ -1,0 +1,4 @@
+﻿level,database,rate_accuracy,rate_completeness,rate_semantic_consistency,tables_in_scope,source_rows_total,planned_operations,unique_cells,planned_changes_total,dimension,rules,eligible_cells,planned_changes,partial_or_skipped_rules
+poor,health_datalake_poor,0.25,0.25,0.25,22,67587,22413,22413,22413,accuracy,16,23548,4845,5
+poor,health_datalake_poor,0.25,0.25,0.25,22,67587,22413,22413,22413,completeness,16,67717,16929,1
+poor,health_datalake_poor,0.25,0.25,0.25,22,67587,22413,22413,22413,semantic_consistency,5,2555,639,0

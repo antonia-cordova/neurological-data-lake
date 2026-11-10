@@ -1,0 +1,26 @@
+{
+  "database": "health_datalake_poor",
+  "source_database": "health_datalake",
+  "seed": 20261109,
+  "rates": {
+    "accuracy": 0.25,
+    "completeness": 0.25,
+    "semantic_consistency": 0.25
+  },
+  "minimum_changes": {
+    "enabled": true,
+    "minimum_per_nonempty_table": 1
+  },
+  "integrity": {
+    "preserve_primary_keys": true,
+    "preserve_foreign_keys": true,
+    "preserve_unique_constraints": true,
+    "preserve_check_constraints": true,
+    "preserve_not_null_constraints": true
+  },
+  "audit": {
+    "preserve_etl_runs": true,
+    "generate_ground_truth": true,
+    "generate_csv_report": true
+  }
+}

@@ -1,0 +1,38 @@
+﻿table,column,dimension,eligible,target,planned,status,reason
+gold.fact_area_health,data_value,accuracy,2490,622,621,PLANNED_PARTIAL,Algunos valores no admitieron cambio distinto
+gold.fact_health_integrated,value_numeric,accuracy,2490,622,621,PLANNED_PARTIAL,Algunos valores no admitieron cambio distinto
+public.silver_places_2023,data_value,accuracy,2490,622,622,PLANNED,
+gold.fact_acs_indicator,estimate_numeric,accuracy,108,27,27,PLANNED,
+gold.fact_acs_indicator,percent_numeric,accuracy,96,24,24,PLANNED,
+gold.fact_acs_indicator,margin_of_error_numeric,accuracy,104,26,26,PLANNED,
+gold.fact_acs_indicator,percent_margin_of_error_numeric,accuracy,96,24,20,PLANNED_PARTIAL,Algunos valores no admitieron cambio distinto
+gold.fact_acs_county_indicator,estimate_numeric,accuracy,332,83,83,PLANNED,
+gold.fact_acs_county_indicator,percent_numeric,accuracy,166,42,42,PLANNED,
+gold.fact_acs_county_indicator,margin_of_error_numeric,accuracy,252,63,63,PLANNED,
+gold.fact_acs_county_indicator,percent_margin_of_error_numeric,accuracy,164,41,40,PLANNED_PARTIAL,Algunos valores no admitieron cambio distinto
+gold.fact_brfss_response,numeric_value,accuracy,9614,2404,1370,PLANNED_PARTIAL,Algunos valores no admitieron cambio distinto
+gold.dim_geography,latitude,accuracy,83,21,21,PLANNED,
+gold.dim_geography,longitude,accuracy,83,21,21,PLANNED,
+public.silver_places_2023,latitude,accuracy,2490,622,622,PLANNED,
+public.silver_places_2023,longitude,accuracy,2490,622,622,PLANNED,
+gold.bridge_health_indicator_source,relation_type,semantic_consistency,15,4,4,PLANNED,
+gold.bridge_health_indicator_source,comparability,semantic_consistency,15,4,4,PLANNED,
+gold.dim_brfss_variable,value_type,semantic_consistency,20,5,5,PLANNED,
+gold.dim_health_integrated_indicator,unit,semantic_consistency,15,4,4,PLANNED,
+gold.fact_health_integrated,health_measure_key,semantic_consistency,2490,622,622,PLANNED,
+gold.fact_acs_indicator,estimate_numeric,completeness,81,20,20,PLANNED,
+gold.fact_acs_indicator,margin_of_error_numeric,completeness,78,20,20,PLANNED,
+gold.fact_acs_indicator,percent_numeric,completeness,72,18,18,PLANNED,
+gold.fact_acs_indicator,percent_count_numeric,completeness,7,2,2,PLANNED,
+gold.fact_acs_indicator,percent_margin_of_error_numeric,completeness,76,19,19,PLANNED,
+gold.fact_acs_county_indicator,estimate_numeric,completeness,249,62,62,PLANNED,
+gold.fact_acs_county_indicator,margin_of_error_numeric,completeness,189,47,47,PLANNED,
+gold.fact_acs_county_indicator,percent_numeric,completeness,124,31,31,PLANNED,
+gold.fact_acs_county_indicator,percent_margin_of_error_numeric,completeness,124,31,31,PLANNED,
+gold.fact_brfss_response,numeric_value,completeness,8244,2061,2061,PLANNED,
+gold.fact_brfss_response,raw_value,completeness,54296,13574,13574,PLANNED,
+gold.fact_health_integrated,value_numeric,completeness,1869,467,467,PLANNED,
+gold.fact_health_integrated,value_raw,completeness,0,0,0,NO_ELIGIBLE_ROWS,Sin valores elegibles
+public.silver_acs_2024,estimate,completeness,108,27,27,PLANNED,
+public.silver_acs_county_2024,estimate,completeness,332,83,83,PLANNED,
+public.silver_places_2023,data_value,completeness,1868,467,467,PLANNED,
