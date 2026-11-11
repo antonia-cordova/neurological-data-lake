@@ -1,11 +1,14 @@
 ﻿from __future__ import annotations
+
 import argparse
 import logging
 import subprocess
 import sys
 from pathlib import Path
+
 from sqlalchemy import text
-from scripts.gold.etl_gold_places import create_db_engine
+
+from scripts.gold.db_connection import create_gold_engine
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -16,25 +19,25 @@ SOURCE_CONFIG = {
         "dataset": "places_2025",
         "table": "silver_places_2023",
         "expected_rows": 2490,
-        "module": "scripts.etl_gold_places",
+        "module": "scripts.gold.etl_gold_places",
     },
     "BRFSS": {
         "dataset": "brfss_2023",
         "table": "silver_brfss_2023",
         "expected_rows": 2800,
-        "module": "scripts.etl_gold_brfss",
+        "module": "scripts.gold.etl_gold_brfss",
     },
     "ACS nacional": {
         "dataset": "acs_2024",
         "table": "silver_acs_2024",
         "expected_rows": 113,
-        "module": "scripts.etl_gold_acs",
+        "module": "scripts.gold.etl_gold_acs",
     },
     "ACS County": {
         "dataset": "acs_2024_county_dp05",
         "table": "silver_acs_county_2024",
         "expected_rows": 332,
-        "module": "scripts.etl_gold_acs_county",
+        "module": "scripts.gold.etl_gold_acs_county",
     },
 }
 
@@ -593,7 +596,7 @@ def select_latest_silver_run(conn, name: str, config: dict) -> int:
 def select_source_runs() -> dict[str, int]:
     """Selecciona una Ãºnica versiÃ³n Silver para cada fuente."""
 
-    engine = create_db_engine()
+    engine = create_gold_engine()
 
     try:
         with engine.connect() as conn:
@@ -656,7 +659,7 @@ def execute_stage(
 def stage_is_complete(name: str, run_id: int) -> bool:
     """Comprueba el estado de una etapa sin modificar la base de datos."""
 
-    engine = create_db_engine()
+    engine = create_gold_engine()
 
     try:
         with engine.connect() as conn:
@@ -706,12 +709,77 @@ def run_stage_with_resume(
     logger.info("Etapa validada correctamente: %s", name)
 
 
-def run_pipeline() -> None:
+def rebuild_gold_for_runs(runs: dict[str, int]) -> None:
+    """
+    Elimina los resultados Gold de las versiones Silver seleccionadas.
+
+    Preserva cat?logos, dimensiones compartidas y versiones hist?ricas
+    correspondientes a otros source_run_id.
+    """
+    engine = create_gold_engine()
+
+    deletions = [
+        ("fact_health_integrated", runs["PLACES"]),
+        ("fact_area_health", runs["PLACES"]),
+        ("fact_brfss_response", runs["BRFSS"]),
+        ("fact_acs_county_indicator", runs["ACS County"]),
+        ("fact_acs_indicator", runs["ACS nacional"]),
+        ("dim_acs_indicator", runs["ACS nacional"]),
+    ]
+
+    try:
+        with engine.begin() as conn:
+            database = conn.execute(
+                text("SELECT current_database()")
+            ).scalar_one()
+
+            if database != DATABASE_ALLOWED:
+                raise RuntimeError(
+                    f"Reconstrucci?n cancelada. "
+                    f"Base no autorizada: {database}."
+                )
+
+            logger.warning(
+                "Iniciando reconstrucci?n Gold selectiva. "
+                "Versiones Silver: %s",
+                runs,
+            )
+
+            for table, run_id in deletions:
+                result = conn.execute(
+                    text(
+                        f"DELETE FROM gold.{table} "
+                        "WHERE source_run_id = :run_id"
+                    ),
+                    {"run_id": run_id},
+                )
+
+                logger.info(
+                    "Reconstrucci?n: %s | run_id=%s | eliminados=%s",
+                    table,
+                    run_id,
+                    result.rowcount,
+                )
+
+        logger.info(
+            "Limpieza Gold confirmada. "
+            "Los cat?logos y otras versiones hist?ricas se preservaron."
+        )
+
+    finally:
+        engine.dispose()
+
+
+
+def run_pipeline(rebuild: bool = False) -> None:
     """Ejecuta o reanuda Gold con versiones Silver seleccionadas una sola vez."""
 
     runs = select_source_runs()
 
     logger.info("Versiones Silver seleccionadas: %s", runs)
+
+    if rebuild:
+        rebuild_gold_for_runs(runs)
 
     for name, config in SOURCE_CONFIG.items():
         run_stage_with_resume(
@@ -726,7 +794,7 @@ def run_pipeline() -> None:
 
     run_stage_with_resume(
         name="IntegraciÃ³n PLACES",
-        module="scripts.etl_gold_integrated",
+        module="scripts.gold.etl_gold_integrated",
         run_id=runs["PLACES"],
         arguments=[
             "--places-run-id",
@@ -746,10 +814,19 @@ def main() -> int:
             "seleccionadas de forma centralizada."
         )
     )
-    parser.parse_args()
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help=(
+            "Reconstruye las versiones Gold seleccionadas, "
+            "preservando cat?logos y otras versiones hist?ricas."
+        ),
+    )
+
+    args = parser.parse_args()
 
     try:
-        run_pipeline()
+        run_pipeline(rebuild=args.rebuild)
         return 0
 
     except Exception:

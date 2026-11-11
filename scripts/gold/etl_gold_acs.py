@@ -1,16 +1,16 @@
 ﻿from __future__ import annotations
+
 import argparse
 import logging
-import os
 import re
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from dotenv import load_dotenv
-from sqlalchemy import URL, create_engine, text
-from sqlalchemy.engine import Engine
-from scripts.gold.silver_run_validator import resolve_single_silver_run_id
 
-ROOT = Path(__file__).resolve().parents[1]
+from scripts.gold.db_connection import create_gold_engine
+from scripts.gold.silver_run_validator import resolve_single_silver_run_id
+from sqlalchemy import text
+
+ROOT = Path(__file__).resolve().parents[2]
 
 SOURCE_TABLE = "silver_acs_2024"
 DATASET_NAME = "acs_2024"
@@ -18,6 +18,7 @@ DATASET_NAME = "acs_2024"
 EXPECTED_SOURCE_ROWS = 113
 EXPECTED_FACT_ROWS = 108
 EXPECTED_SECTION_ROWS = 5
+EXPECTED_ROOT_SOURCE_ROW_ID = 109
 
 INSERT_BATCH_SIZE = 100
 
@@ -31,61 +32,11 @@ logging.basicConfig(
 logger = logging.getLogger("etl_gold_acs")
 
 
-
-def create_db_engine() -> Engine:
-    load_dotenv(ROOT / ".env", override=False)
-
-    database = os.getenv("POSTGRES_DB")
-    if database != "health_datalake":
-        raise RuntimeError(
-            "ETL bloqueado: solo se permite health_datalake."
-        )
-
-    required = ["POSTGRES_USER", "POSTGRES_PASSWORD"]
-    missing = [key for key in required if not os.getenv(key)]
-    if missing:
-        raise RuntimeError(
-            f"Faltan variables en .env: {', '.join(missing)}"
-        )
-
-    url = URL.create(
-        "postgresql+psycopg",
-        username=os.environ["POSTGRES_USER"],
-        password=os.environ["POSTGRES_PASSWORD"],
-        host=os.getenv("POSTGRES_HOST", "localhost"),
-        port=int(os.getenv("POSTGRES_PORT", "5432")),
-        database=database,
-    )
-
-    engine = create_engine(
-        url,
-        pool_pre_ping=True,
-        connect_args={"connect_timeout": 5},
-    )
-
-    try:
-        with engine.connect() as conn:
-            actual_database = conn.execute(
-                text("SELECT current_database()")
-            ).scalar_one()
-
-            if actual_database != "health_datalake":
-                raise RuntimeError(
-                    f"ConexiÃ³n rechazada: base detectada {actual_database}."
-                )
-    except Exception:
-        engine.dispose()
-        raise
-
-    logger.info("ConexiÃ³n PostgreSQL validada: %s", database)
-    return engine
-
-
 def resolve_source_run_id(
     conn,
     requested_run_id: int | None = None,
 ) -> int:
-    """Selecciona y valida una ejecuciÃ³n Silver de ACS nacional."""
+    """Selecciona y valida una ejecuciÃƒÂ³n Silver de ACS nacional."""
 
     run_id = resolve_single_silver_run_id(
         conn,
@@ -122,7 +73,7 @@ def validate_source_run(conn, source_run_id: int) -> dict:
 
     if run is None:
         raise ValueError(
-            f"No existe la ejecuciÃ³n run_id={source_run_id}."
+            f"No existe la ejecuciÃƒÂ³n run_id={source_run_id}."
         )
 
     if run["dataset_name"] != DATASET_NAME:
@@ -137,7 +88,7 @@ def validate_source_run(conn, source_run_id: int) -> dict:
 
     if run["status"] != "succeeded":
         raise ValueError(
-            "La ejecuciÃ³n de Silver no terminÃ³ correctamente."
+            "La ejecuciÃƒÂ³n de Silver no terminÃƒÂ³ correctamente."
         )
 
     if run["source_rows"] != EXPECTED_SOURCE_ROWS:
@@ -157,11 +108,11 @@ def validate_source_run(conn, source_run_id: int) -> dict:
 
 def parse_numeric(raw_value: str | None) -> Decimal | None:
     """
-    Convierte valores numÃ©ricos ACS sin alterar la columna raw.
+    Convierte valores numÃƒÂ©ricos ACS sin alterar la columna raw.
 
-    Admite separadores de miles correctamente agrupados, el prefijo Â±
-    utilizado en mÃ¡rgenes de error y el sufijo % utilizado en porcentajes.
-    Los marcadores estadÃ­sticos se conservan en raw y se representan como NULL.
+    Admite separadores de miles correctamente agrupados, el prefijo Ã‚Â±
+    utilizado en mÃƒÂ¡rgenes de error y el sufijo % utilizado en porcentajes.
+    Los marcadores estadÃƒÂ­sticos se conservan en raw y se representan como NULL.
     """
     if raw_value is None or raw_value.strip() == "":
         return None
@@ -171,18 +122,18 @@ def parse_numeric(raw_value: str | None) -> Decimal | None:
     if value in {"*****", "(X)"}:
         return None
 
-    if value.startswith("±"):
+    if value.startswith("\u00b1"):
         value = value[1:].strip()
 
     if value.endswith("%"):
         value = value[:-1].strip()
 
-    # No eliminar sÃ­mbolos de forma indiscriminada: una cadena mal formada
-    # debe rechazarse, no convertirse silenciosamente en otro nÃºmero.
+    # No eliminar sÃƒÂ­mbolos de forma indiscriminada: una cadena mal formada
+    # debe rechazarse, no convertirse silenciosamente en otro nÃƒÂºmero.
     numeric_pattern = r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
     if not re.fullmatch(numeric_pattern, value):
         raise ValueError(
-            f"Formato numÃ©rico ACS no reconocido: {raw_value!r}"
+            f"Formato numÃƒÂ©rico ACS no reconocido: {raw_value!r}"
         )
 
     try:
@@ -192,10 +143,9 @@ def parse_numeric(raw_value: str | None) -> Decimal | None:
             f"No se pudo convertir el valor: {raw_value!r}"
         ) from exc
 
-
 def indentation_and_label(label: str) -> tuple[int, str]:
     """
-    Conserva el nÃºmero original de caracteres de indentaciÃ³n.
+    Conserva el nÃƒÂºmero original de caracteres de indentaciÃƒÂ³n.
     No utiliza strip() sobre el valor almacenado.
     """
     indentation = len(label) - len(label.lstrip(INDENT_CHARS))
@@ -207,7 +157,7 @@ def indentation_and_label(label: str) -> tuple[int, str]:
 def classify_percent(raw_value: str | None) -> tuple:
     """
     Devuelve:
-    (tipo, porcentaje_numÃ©rico, conteo_numÃ©rico)
+    (tipo, porcentaje_numÃƒÂ©rico, conteo_numÃƒÂ©rico)
     """
     if raw_value is None or raw_value.strip() == "":
         return "NULL", None, None
@@ -274,7 +224,7 @@ def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
         or lineage["rows_with_estimate"] != EXPECTED_FACT_ROWS
     ):
         raise ValueError(
-            f"ValidaciÃ³n de Silver incorrecta para run_id={run_id}: "
+            f"ValidaciÃƒÂ³n de Silver incorrecta para run_id={run_id}: "
             f"{dict(lineage)}"
         )
 
@@ -343,7 +293,7 @@ def load_dimensions(conn, records: list[dict], source_run_id: int):
 
         if not normalized:
             raise ValueError(
-                f"Etiqueta vacÃ­a en acs_row_id={row['acs_row_id']}."
+                f"Etiqueta vacÃƒÂ­a en acs_row_id={row['acs_row_id']}."
             )
 
         is_section = (
@@ -361,7 +311,7 @@ def load_dimensions(conn, records: list[dict], source_run_id: int):
             "is_section": is_section,
         })
 
-    # No sobrescribir dimensiones histÃ³ricas
+    # No sobrescribir dimensiones histÃƒÂ³ricas
     existing = conn.execute(
         text("""
             SELECT COUNT(*)
@@ -374,7 +324,7 @@ def load_dimensions(conn, records: list[dict], source_run_id: int):
     if existing:
         raise RuntimeError(
             f"Ya existen {existing} indicadores para run_id={source_run_id}. "
-            "No se sobrescriben versiones histÃ³ricas."
+            "No se sobrescriben versiones histÃƒÂ³ricas."
         )
 
     conn.execute(
@@ -418,7 +368,7 @@ def load_dimensions(conn, records: list[dict], source_run_id: int):
 
     if len(dimension_rows) != EXPECTED_SOURCE_ROWS:
         raise RuntimeError(
-            f"DimensiÃ³n ACS incompleta: {len(dimension_rows)} filas; "
+            f"DimensiÃƒÂ³n ACS incompleta: {len(dimension_rows)} filas; "
             f"se esperaban {EXPECTED_SOURCE_ROWS}."
         )
 
@@ -428,7 +378,7 @@ def load_dimensions(conn, records: list[dict], source_run_id: int):
 
     if dimension_section_count != EXPECTED_SECTION_ROWS:
         raise RuntimeError(
-            f"La dimensiÃ³n contiene {dimension_section_count} secciones; "
+            f"La dimensiÃƒÂ³n contiene {dimension_section_count} secciones; "
             f"se esperaban {EXPECTED_SECTION_ROWS}."
         )
 
@@ -455,12 +405,12 @@ def load_dimensions(conn, records: list[dict], source_run_id: int):
 
         if row["is_section"] and current_indent != 0:
             raise ValueError(
-                "Una secciÃ³n ACS debe encontrarse en el nivel raÃ­z: "
+                "Una secciÃƒÂ³n ACS debe encontrarse en el nivel raÃƒÂ­z: "
                 f"source_row_id={row['source_row_id']}."
             )
 
-        # Un indicador puede ser raÃ­z y no tener padre.
-        # Se conserva la jerarquÃ­a cuando existe un padre.
+        # Un indicador puede ser raÃƒÂ­z y no tener padre.
+        # Se conserva la jerarquÃƒÂ­a cuando existe un padre.
 
         parent_updates.append({
             "indicator_key": row["indicator_key"],
@@ -500,7 +450,7 @@ def load_dimensions(conn, records: list[dict], source_run_id: int):
             COUNT(*) FILTER (
                 WHERE NOT child.is_section
                   AND child.parent_indicator_key IS NULL
-                  AND child.source_row_id <> 109
+                  AND child.source_row_id <> :expected_root_source_row_id
             ) AS unexpected_root_indicators,
 
             COUNT(*) FILTER (
@@ -520,7 +470,10 @@ def load_dimensions(conn, records: list[dict], source_run_id: int):
 
         WHERE child.source_run_id = :run_id
     """),
-    {"run_id": source_run_id},
+    {
+        "run_id": source_run_id,
+        "expected_root_source_row_id": EXPECTED_ROOT_SOURCE_ROW_ID,
+    },
 ).mappings().one()
 
     expected_hierarchy = {
@@ -538,12 +491,12 @@ def load_dimensions(conn, records: list[dict], source_run_id: int):
         for key, expected in expected_hierarchy.items()
     ):
         raise RuntimeError(
-            "JerarquÃ­a ACS invÃ¡lida: "
+            "JerarquÃƒÂ­a ACS invÃƒÂ¡lida: "
             f"{dict(hierarchy_validation)}"
         )
 
     logger.info(
-        "DimensiÃ³n ACS validada | indicadores=%s | secciones=%s",
+        "DimensiÃƒÂ³n ACS validada | indicadores=%s | secciones=%s",
         hierarchy_validation["total_rows"],
         hierarchy_validation["section_rows"],
     )
@@ -570,7 +523,7 @@ def load_facts(
 
     if source_key is None:
         raise ValueError(
-            "No se encontrÃ³ ACS en gold.dim_source."
+            "No se encontrÃƒÂ³ ACS en gold.dim_source."
         )
 
     existing = conn.execute(
@@ -626,7 +579,7 @@ def load_facts(
     for row in records:
         estimate_raw = row["estimate"]
 
-        # Las cinco filas de encabezados se conservan en la dimensiÃ³n, no generan hechos estadÃ­sticos
+        # Las cinco filas de encabezados se conservan en la dimensiÃƒÂ³n, no generan hechos estadÃƒÂ­sticos
         if estimate_raw is None or estimate_raw.strip() == "":
             continue
 
@@ -641,7 +594,7 @@ def load_facts(
 
         if estimate_numeric is not None and estimate_numeric < 0:
             raise ValueError(
-                "EstimaciÃ³n ACS negativa en DP05: "
+                "EstimaciÃƒÂ³n ACS negativa en DP05: "
                 f"acs_row_id={row['acs_row_id']}, valor={estimate_raw!r}."
             )
 
@@ -698,7 +651,7 @@ def load_facts(
 
     if loaded != EXPECTED_FACT_ROWS or persisted != EXPECTED_FACT_ROWS:
         raise RuntimeError(
-            f"ValidaciÃ³n fallida: insertados={loaded}, "
+            f"ValidaciÃƒÂ³n fallida: insertados={loaded}, "
             f"persistidos={persisted}, esperados={EXPECTED_FACT_ROWS}."
         )
 
@@ -707,7 +660,7 @@ def load_facts(
 
 
 def run_etl(source_run_id: int | None = None):
-    engine = create_db_engine()
+    engine = create_gold_engine()
 
     try:
         with engine.begin() as conn:
@@ -764,7 +717,7 @@ def main() -> int:
         default=None,
         help=(
             "run_id de Silver. Si se omite, "
-            "se selecciona automÃ¡ticamente la versiÃ³n vigente."
+            "se selecciona automÃƒÂ¡ticamente la versiÃƒÂ³n vigente."
         ),
     )
 
@@ -774,7 +727,7 @@ def main() -> int:
         run_etl(args.source_run_id)
         return 0
     except Exception:
-        logger.exception("FallÃ³ el ETL Gold ACS.")
+        logger.exception("FallÃƒÂ³ el ETL Gold ACS.")
         return 1
 
 

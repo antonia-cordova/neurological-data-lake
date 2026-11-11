@@ -1,16 +1,16 @@
 ﻿from __future__ import annotations
+
 import argparse
 import logging
-import os
 import re
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from dotenv import load_dotenv
-from sqlalchemy import URL, create_engine, text
-from sqlalchemy.engine import Engine
-from scripts.gold.silver_run_validator import resolve_single_silver_run_id
 
-ROOT = Path(__file__).resolve().parents[1]
+from scripts.gold.db_connection import create_gold_engine
+from scripts.gold.silver_run_validator import resolve_single_silver_run_id
+from sqlalchemy import text
+
+ROOT = Path(__file__).resolve().parents[2]
 
 SOURCE_TABLE = "silver_acs_county_2024"
 DATASET_NAME = "acs_2024_county_dp05"
@@ -36,56 +36,6 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("etl_gold_acs_county")
-
-
-
-def create_db_engine() -> Engine:
-    load_dotenv(ROOT / ".env", override=False)
-
-    database = os.getenv("POSTGRES_DB")
-    if database != "health_datalake":
-        raise RuntimeError(
-            "ETL bloqueado: solo se permite health_datalake."
-        )
-
-    required = ["POSTGRES_USER", "POSTGRES_PASSWORD"]
-    missing = [key for key in required if not os.getenv(key)]
-    if missing:
-        raise RuntimeError(
-            f"Faltan variables en .env: {', '.join(missing)}"
-        )
-
-    url = URL.create(
-        "postgresql+psycopg",
-        username=os.environ["POSTGRES_USER"],
-        password=os.environ["POSTGRES_PASSWORD"],
-        host=os.getenv("POSTGRES_HOST", "localhost"),
-        port=int(os.getenv("POSTGRES_PORT", "5432")),
-        database=database,
-    )
-
-    engine = create_engine(
-        url,
-        pool_pre_ping=True,
-        connect_args={"connect_timeout": 5},
-    )
-
-    try:
-        with engine.connect() as conn:
-            actual_database = conn.execute(
-                text("SELECT current_database()")
-            ).scalar_one()
-
-            if actual_database != "health_datalake":
-                raise RuntimeError(
-                    f"Conexión rechazada: base detectada {actual_database}."
-                )
-    except Exception:
-        engine.dispose()
-        raise
-
-    logger.info("Conexión PostgreSQL validada: %s", database)
-    return engine
 
 
 def resolve_source_run_id(
@@ -503,7 +453,7 @@ def load_facts(
 
 
 def run_etl(source_run_id: int | None = None) -> None:
-    engine = create_db_engine()
+    engine = create_gold_engine()
 
     try:
         with engine.begin() as conn:

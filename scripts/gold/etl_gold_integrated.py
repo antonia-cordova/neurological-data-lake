@@ -4,10 +4,9 @@ import logging
 import os
 from pathlib import Path
 from typing import Any
-from dotenv import load_dotenv
-from sqlalchemy import URL, create_engine, text
-from sqlalchemy.engine import Connection, Engine
-
+from sqlalchemy import text
+from scripts.gold.db_connection import create_gold_engine
+from sqlalchemy.engine import Connection
 from scripts.gold.silver_run_validator import resolve_single_silver_run_id
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -154,53 +153,6 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logger = logging.getLogger("etl_gold_integrated")
-
-
-def create_db_engine() -> Engine:
-    load_dotenv(ROOT / ".env", override=False)
-
-    database = os.getenv("POSTGRES_DB")
-    if database != "health_datalake":
-        raise RuntimeError(
-            "ETL integrado bloqueado: solo se permite health_datalake."
-        )
-
-    required = ["POSTGRES_USER", "POSTGRES_PASSWORD"]
-    missing = [key for key in required if not os.getenv(key)]
-    if missing:
-        raise RuntimeError(f"Faltan variables: {', '.join(missing)}")
-
-    url = URL.create(
-        "postgresql+psycopg",
-        username=os.environ["POSTGRES_USER"],
-        password=os.environ["POSTGRES_PASSWORD"],
-        host=os.getenv("POSTGRES_HOST", "localhost"),
-        port=int(os.getenv("POSTGRES_PORT", "5432")),
-        database=database,
-    )
-
-    engine = create_engine(
-        url,
-        pool_pre_ping=True,
-        connect_args={"connect_timeout": 5},
-    )
-
-    try:
-        with engine.connect() as conn:
-            actual_database = conn.execute(
-                text("SELECT current_database()")
-            ).scalar_one()
-
-            if actual_database != "health_datalake":
-                raise RuntimeError(
-                    f"ConexiÃ³n rechazada: base detectada {actual_database}."
-                )
-    except Exception:
-        engine.dispose()
-        raise
-
-    logger.info("ConexiÃ³n PostgreSQL validada: %s", database)
-    return engine
 
 
 def resolve_and_validate_places_run(
@@ -692,7 +644,7 @@ def load_integrated_places_facts(
 
 
 def run_etl(places_run_id: int | None = None) -> None:
-    engine = create_db_engine()
+    engine = create_gold_engine()
 
     try:
         with engine.begin() as conn:

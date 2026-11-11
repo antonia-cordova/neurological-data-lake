@@ -64,11 +64,15 @@ health_datalake_dev_backup.dump
 backups/
 *.bak
 
-*.py[cod]"scripts/gold/__pycache__/silver_run_validator.cpython-312.pyc@\n\n# Python compiled files and cache directories\n__pycache__/\n*.py[cod]\n@"
-
 # Python compiled files and cache directories
 __pycache__/
 *.py[cod]
 
-# Quality experiment backups
-*.jsonl.backup
+# Experimento de calidad
+quality/ground_truth/
+quality/reports/
+
+
+# Experimento de calidad
+quality/ground_truth/
+quality/reports/

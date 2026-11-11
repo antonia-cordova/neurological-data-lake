@@ -1,12 +1,12 @@
 ﻿from __future__ import annotations
+
 import argparse
 import logging
-import os
 from pathlib import Path
-from dotenv import load_dotenv
-from sqlalchemy import URL, create_engine, text
-from sqlalchemy.engine import Engine
+
+from scripts.gold.db_connection import create_gold_engine
 from scripts.gold.silver_run_validator import resolve_single_silver_run_id
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -27,57 +27,6 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("etl_gold_places")
-
-
-
-def create_db_engine() -> Engine:
-    load_dotenv(ROOT / ".env", override=False)
-
-    allowed_database = "health_datalake"
-    database = os.getenv("POSTGRES_DB")
-
-    if database != allowed_database:
-        raise RuntimeError(
-            f"ConexiÃ³n rechazada: la base configurada es "
-            f"'{database}', pero solo se permite '{allowed_database}'."
-        )
-
-    required = ["POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"]
-    missing = [name for name in required if not os.getenv(name)]
-
-    if missing:
-        raise RuntimeError(
-            f"Faltan variables de conexiÃ³n: {', '.join(missing)}"
-        )
-
-    url = URL.create(
-        "postgresql+psycopg",
-        username=os.environ["POSTGRES_USER"],
-        password=os.environ["POSTGRES_PASSWORD"],
-        host=os.getenv("POSTGRES_HOST", "localhost"),
-        port=int(os.getenv("POSTGRES_PORT", "5432")),
-        database=database,
-    )
-
-    engine = create_engine(url, pool_pre_ping=True)
-
-    try:
-        with engine.connect() as conn:
-            current_database = conn.execute(
-                text("SELECT current_database()")
-            ).scalar_one()
-
-            if current_database != allowed_database:
-                raise RuntimeError(
-                    f"ConexiÃ³n rechazada: PostgreSQL respondiÃ³ "
-                    f"con la base '{current_database}'."
-                )
-
-        return engine
-
-    except Exception:
-        engine.dispose()
-        raise
 
 
 def resolve_source_run_id(
@@ -692,7 +641,7 @@ def load_facts(
     return loaded_rows
 
 def run_etl(source_run_id: int | None = None) -> None:
-    engine = create_db_engine()
+    engine = create_gold_engine()
 
     try:
         with engine.begin() as conn:

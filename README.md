@@ -1,94 +1,274 @@
 # Neurological Data Lake
 
-## 1. Fuentes de datos del proyecto
+Neurological Data Lake es una arquitectura de datos orientada a la integración, transformación y análisis de información sanitaria y demográfica de Estados Unidos.
 
-- **ACS 2024:** American Community Survey, conjunto DP05 de estimaciones demográficas a cinco años.
-- **BRFSS 2023:** Behavioral Risk Factor Surveillance System.
-- **PLACES:** PLACES: Local Data for Better Health, publicación 2025, filtrada para observaciones correspondientes al año 2023.
+El proyecto implementa una arquitectura de Data Lake con tres capas: Bronze, Silver y Gold. A partir de la base de datos original se generan, además, dos copias experimentales con distintos niveles de degradación intencional de calidad: Medium y Poor.
 
-La arquitectura contempla la organización de los datos desde su almacenamiento original en Bronze hasta su transformación y consolidación en Silver.
-Las capas Gold y Platinum están contempladas para implementarse como siguiente paso. 
+---
 
+## 2. Fuentes de datos
 
-## 2. Arquitectura
+| Fuente | Descripción |
+|---|---|
+| ACS 2024 | American Community Survey, estimaciones demográficas DP05 a cinco años. |
+| ACS County 2024 | Estimaciones demográficas DP05 a nivel de condado. |
+| BRFSS 2023 | Behavioral Risk Factor Surveillance System. |
+| PLACES 2025 | Local Data for Better Health, publicación 2025, con observaciones correspondientes a 2023. |
 
+La muestra BRFSS utilizada contiene 2.800 personas y 20 variables seleccionadas mediante un procedimiento determinista estratificado.
+
+## 3. Arquitectura
+
+El proyecto utiliza una arquitectura Medallion con las siguientes capas:
 
 | Capa | Descripción |
 |---|---|
-| Source | Referencia y organización de las fuentes originales |
-| Bronze | Almacenamiento de los datos originales, conservando su estructura de origen |
-| Silver | Datos transformados, estructurados y preparados para análisis |
-| Gold | Capa destinada a productos analíticos, integración y agregaciones |
-| Platinum | Capa destinada a productos de datos especializados como (graficos) |
+| Bronze | Almacenamiento de los datos originales descargados desde las fuentes oficiales. |
+| Silver | Datos transformados, estructurados, tipados y preparados para análisis. |
+| Gold | Modelo dimensional, tablas de hechos, dimensiones, integración geográfica y consolidación analítica. |
+| Platinum | Capa contemplada para una futura implementación de productos analíticos avanzados. |
 
-### 2.1. Arquitectura tecnológica
+A partir de la base original Gold se generan dos bases de datos adicionales:
 
-- Python 3.12 para los procesos ETL.
-- PostgreSQL 17 como motor de almacenamiento.
-- Docker Compose para la administración del servicio PostgreSQL.
-- Pandas y PyReadStat para lectura y procesamiento de datos.
-- PyArrow para procesamiento de datos.
-- SQLAlchemy y Psycopg para conexión con PostgreSQL.
-- JSONB para almacenamiento flexible de variables BRFSS.
-- PyYAML y python-dotenv para configuración y gestión de variables de entorno.
+| Base de datos | Descripción |
+|---|---|
+| `health_datalake` | Base original, sin degradación intencional. |
+| `health_datalake_medium` | Copia con degradación controlada de calidad de nivel medio. |
+| `health_datalake_poor` | Copia con degradación controlada de calidad de nivel alto. |
 
-## 3. Fuentes de datos
+Las bases Medium y Poor se generan independientemente desde la base original. **No se aplica una degradación sucesiva de Medium hacia Poor.**
 
-### 3.1. ACS 2024
+## 4. Tecnologías
 
-American Community Survey, archivo DP05 de estimaciones demográficas a cinco años (5-Year Estimates).
+- Python 3.12.
+- PostgreSQL 17.
+- Docker y Docker Compose v2.
+- Pandas.
+- PyReadStat.
+- PyArrow.
+- SQLAlchemy.
+- Psycopg.
+- JSONB.
+- PyYAML.
+- python-dotenv.
 
-- Fuente: ACS 2024.
-- Tabla: DP05.
-- Archivo: CSV.
-- Registros Silver esperados: 113.
-- Columnas físicas en Silver: 7.
-
-### 3.2. BRFSS 2023
-
-Behavioral Risk Factor Surveillance System.
-
-- Fuente: BRFSS 2023.
-- Archivo original: `LLCP2023.XPT`.
-- Diccionario de variables: `USCODE23_LLCP_021924.HTML`.
-- Registros originales: 433.323.
-- Registros seleccionados para Silver: 2.800.
-- Variables seleccionadas: 20.
-- Almacenamiento de variables: JSONB.
-- Columnas físicas en Silver: 5.
-
-La selección utiliza un procedimiento determinista estratificado.
-
-La muestra se utiliza para la construcción y validación de la arquitectura de datos. 
-
-### 3.3. PLACES
-
-PLACES: Local Data for Better Health.
-
-- Fuente: publicación 2025.
-- Año de observación seleccionado: 2023.
-- Registros originales procesados: 229.298.
-- Registros correspondientes al año 2023: 197.848.
-- Ubicaciones: 83.
-- Jurisdicciones: 49.
-- Indicadores: 15.
-- Tipos de valores: 2.
-- Registros Silver esperados: 2.490.
-- Columnas físicas en Silver: 9.
-
-## 4. Requisitos
-
-Para ejecutar el proyecto se requiere:
+## 5. Requisitos
 
 - Git.
-- Python 3.12.
-- Docker Desktop.
+- Python 3.12.x.
+- Docker Desktop o Docker Engine.
 - Docker Compose v2.
-- PostgreSQL 17, administrado mediante Docker Compose.
 
 
+## 6. Instalación y configuración
 
-## 5. Estructura del proyecto
+### 6.1. Clonar el repositorio
+
+```bash
+git clone -b develop https://github.com/antonia-cordova/neurological-data-lake.git
+
+cd neurological-data-lake
+```
+
+### 6.2. Incorporar los datos Bronze
+
+Los archivos correspondientes a la capa bronze se comparten en un archivo .zip y no se incluyen directamente en GitHub.
+
+Descargar y extraer la carpeta en la siguiente ubicacion:
+
+```text
+data/bronze/
+├── acs_2024/
+├── acs_2024_county/
+├── brfss_2023/
+└── places_2025/
+```
+
+
+### 6.3. Crear el entorno virtual
+
+Desde la raíz del repositorio:
+
+```bash
+python3 -m venv .venv
+
+source .venv/bin/activate
+```
+
+### 6.4. Instalar dependencias
+
+```bash
+python -m pip install --upgrade pip
+
+python -m pip install -r requirements-lock.txt
+
+python -m pip check
+```
+
+### 6.5. Configurar variables de entorno
+
+Crear el archivo `.env` a partir del archivo de ejemplo:
+
+```bash
+cp .env.example .env
+```
+
+Editar el archivo:
+
+```bash
+nano .env
+```
+
+No olvidar ajustar la contraseña localmente.
+
+La configuración del archivo `.env` debe coincidir con la utilizada por Docker Compose y los procesos Python.
+
+---
+
+## 7. Ejecución completa del Data Lake
+
+```bash
+# 1. Activar entorno virtual
+source .venv/bin/activate
+
+# 2. Iniciar PostgreSQL
+docker compose up -d postgres
+
+# 3. Comprobar disponibilidad de PostgreSQL
+docker compose exec postgres pg_isready -U datalake_user -d health_datalake
+
+# 4. Inicializar la base de datos
+python -m scripts.initialize_dev_db
+
+# 5. Ejecutar pipeline Silver
+python -m scripts.run_silver_pipeline
+
+# 6. Ejecutar pipeline Gold
+python -m scripts.run_gold_pipeline
+
+# 7. Generar versión Medium
+python scripts/quality/quality_generator.py --level medium --execute
+
+# 8. Generar versión Poor
+python scripts/quality/quality_generator.py --level poor --execute
+```
+
+---
+
+## 8. Presupuesto de almacenamiento Silver
+
+El proyecto establece un límite máximo de **100.000 celdas lógicas** para la capa Silver.
+
+El control se implementa mediante `scripts/silver_budget.py` y utiliza un bloqueo transaccional de PostgreSQL para gestionar cargas concurrentes.
+
+### 8.1. Distribución
+
+| Dataset | Registros | Celdas por registro | Total |
+|---|---:|---:|---:|
+| PLACES 2023 | 2.490 | 9 | 22.410 |
+| BRFSS 2023 | 2.800 | 24 | 67.200 |
+| ACS 2024 | 113 | 7 | 791 |
+| ACS County 2024 | 332 | 10 | 3.320 |
+| **Total** | **5.735** | | **93.721** |
+
+### 8.2. Capacidad
+
+- Capacidad máxima: 100.000 celdas.
+- Consumo: 93.721 celdas.
+- Capacidad disponible: 6.279 celdas.
+- Porcentaje utilizado: 93,721 %.
+
+En BRFSS se contabilizan cuatro campos escalares por registro y veinte claves almacenadas en JSONB.
+
+---
+
+## 9. Validaciones y trazabilidad
+
+La tabla `public.etl_runs` registra las ejecuciones ETL, permitiendo consultar su estado, origen y cantidad de registros procesados y cargados.
+
+La arquitectura incorpora:
+
+- Validación de los datos de origen.
+- Validación de las ejecuciones Silver.
+- Control de integridad referencial.
+- Validación de dimensiones y tablas de hechos.
+- Verificación de relaciones geográficas.
+- Control de restricciones y columnas obligatorias.
+- Trazabilidad entre las capas Silver y Gold.
+
+Las tablas de hechos Gold conservan referencias a sus fuentes y a las ejecuciones Silver de origen.
+
+## 10. Modelo dimensional Gold
+
+La capa Gold está compuesta por 17 tablas organizadas en dimensiones, tablas de hechos y correspondencias geográficas.
+
+Entre sus componentes se encuentran:
+
+- Dimensiones de fuentes y geografías.
+- Dimensiones de indicadores ACS y variables BRFSS.
+- Tablas de hechos PLACES.
+- Tablas de hechos ACS nacional.
+- Tablas de hechos ACS County.
+- Tablas de hechos BRFSS.
+- Integración de información sanitaria y geográfica.
+
+El modelo permite relacionar información sanitaria y demográfica mediante claves geográficas, indicadores y referencias de ejecución.
+
+---
+
+## 11. Generación de versiones degradadas
+
+El proyecto permite estudiar el efecto de la degradación intencional de calidad sobre los datos mediante dos versiones adicionales.
+
+Las degradaciones se aplican sobre copias independientes de la base original, preservando `health_datalake` como referencia sin degradación.
+
+### 11.1. Niveles de degradación
+
+| Dimensión | Medium | Poor |
+|---|---:|---:|
+| Accuracy | 5 % | 25 % |
+| Completeness | 5 % | 25 % |
+| Semantic consistency | 5 % | 25 % |
+
+### 11.2. Resultados de la ejecución validada
+
+La ejecución de referencia generó los siguientes resultados:
+
+| Indicador | Medium | Poor |
+|---|---:|---:|
+| Tablas procesadas | 22 | 22 |
+| Filas de origen | 67.677 | 67.677 |
+| Operaciones planificadas | 4.798 | 23.194 |
+| Celdas únicas a alterar | 4.798 | 23.194 |
+| Constraints verificadas | 112 | 112 |
+| Columnas NOT NULL verificadas | 114 | 114 |
+
+Ambas bases fueron creadas y validadas correctamente.
+
+Los resultados corresponden a la ejecución de referencia y pueden variar si cambian los datos o las reglas de degradación.
+
+### 11.3. Informes de calidad
+
+Los informes generados se almacenan en:
+
+```text
+quality/reports/
+```
+
+Entre ellos se encuentran:
+
+- `quality_dry_run_rules_medium.csv`
+- `quality_dry_run_changes_medium.csv`
+- `quality_dry_run_summary_medium.csv`
+- `quality_dry_run_rules_poor.csv`
+- `quality_dry_run_changes_poor.csv`
+- `quality_dry_run_summary_poor.csv`
+
+Estos archivos permiten revisar las reglas aplicadas, las operaciones planificadas y los cambios asociados a cada nivel de degradación.
+
+---
+
+## 12. Estructura general del proyecto
 
 ```text
 neurological-data-lake/
@@ -102,201 +282,48 @@ neurological-data-lake/
 ├── requirements-lock.txt
 ├── requirements-dev.txt
 │
+│
 ├── data/
 │   ├── source/
 │   ├── bronze/
-│   │   ├── acs_2024/
-│   │   ├── brfss_2023/
-│   │   └── places_2025/
-│   ├── silver/
-│   ├── gold/
-│   └── platinum/
+│   └── 
+│
+├── docs/
+│
+├── quality/
+│   └── reports/
 │
 ├── scripts/
-│   ├── etl_acs.py
-│   ├── etl_brfss.py
-│   ├── etl_places.py
-│   └── silver_budget.py
+│   ├── gold/
+│   ├── quality/
+│   ├── silver/
+│   ├── initialize_dev_db.py
+│   ├── run_silver_pipeline.py
+│   └── run_gold_pipeline.py
 │
-└── sql/
-    └── silver/
-        └── schema_silver.sql
-```
-
-Los archivos originales de datos no se incluyen en GitHub. Deben descargarse y ubicarse localmente en sus respectivas carpetas Bronze.
-
-
-## 6. Instalación y configuración
-
-### 6.1. Clonar el repositorio
-
-```bash
-git clone -b develop https://github.com/antonia-cordova/neurological-data-lake.git
-cd neurological-data-lake
-```
-
-### 6.2. Verificar Python
-
-```bash
-python3 --version
-```
-
-Se requiere Python 3.12.x.
-
-### 6.3. Crear el entorno virtual
-
-```bash
-python3 -m venv .venv
-```
-
-Activar el entorno virtual:
-
-```bash
-source .venv/bin/activate
-```
-
-Verificar el intérprete:
-
-```bash
-python -c "import sys; print(sys.executable)"
-```
-
-El resultado debe apuntar al entorno `.venv` del proyecto.
-
-### 6.4. Instalar dependencias
-
-Para reproducir el entorno validado se recomienda utilizar el archivo de versiones bloqueadas:
-
-```bash
-python -m pip install --upgrade pip
-python -m pip install -r requirements-lock.txt
-```
-
-Verificar las dependencias:
-
-```bash
-python -m pip check
-```
-
-
-### 6.5. Configurar variables de entorno
-
-Crear el archivo `.env` a partir del ejemplo:
-
-```bash
-cp .env.example .env
-```
-
-
-Configuración estándar:
-
-```dotenv
-POSTGRES_DB=health_datalake
-POSTGRES_USER=datalake_user
-POSTGRES_PASSWORD=CAMBIAR_POR_UNA_CLAVE_SEGURA
-POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
-APP_ENV=development
-LOG_LEVEL=INFO
-```
-
-
-## 7. Levantar PostgreSQL
-
-Iniciar el servicio:
-
-```bash
-docker compose up -d postgres
-```
-
-
-## 8. Preparar los datos Bronze
-
-Los archivos originales deben estar ubicados en las siguientes rutas:
-
-```text
-data/bronze/
+├── sql/
+│   ├── silver/
+│   └── gold/
+│       └── migrations/
 │
-├── acs_2024/
-│   └── ACSDP5Y2024.DP05-2026-10-24T014032.csv
-│
-├── brfss_2023/
-│   ├── LLCP2023.XPT
-│   └── USCODE23_LLCP_021924.HTML
-│
-└── places_2025/
-    └── PLACES__Local_Data_for_Better_Health,_County_Data,_2025_release_20261024.csv
+└── src/
 ```
 
-Los archivos originales no se versionan en GitHub, enviare un link de swisstransfer
+La estructura representa la organización general del repositorio. Los archivos de datos originales se mantienen fuera del control de versiones.
 
-## 9. Crear el esquema Silver
+---
 
-Ejecutar:
+## 13. Estado del proyecto
 
-```bash
-docker compose exec -T postgres psql -U datalake_user -d health_datalake < sql/silver/schema_silver.sql
-```
+El proyecto cuenta con una implementación funcional de las capas Bronze, Silver y Gold, junto con la generación automatizada de las bases de datos Medium y Poor.
 
-El esquema crea las siguientes tablas:
+La instalación limpia de referencia fue validada mediante la ejecución completa de los procesos:
 
-- `public.etl_runs`
-- `public.silver_places_2023`
-- `public.silver_brfss_2023`
-- `public.silver_acs_2024`
+- Inicialización de PostgreSQL y estructura de tablas.
+- Carga de los cuatro datasets en Silver.
+- Ejecución y validación de las etapas Gold.
+- Integración geográfica PLACES.
+- Generación y validación de `health_datalake_medium`.
+- Generación y validación de `health_datalake_poor`.
 
-
-## 10. Procesos ETL
-
-Los procesos ETL se encuentran en la carpeta `scripts/`.
-
-Para una instalación inicial, se recomienda ejecutar los procesos en el siguiente orden:
-
-1. PLACES 2023.
-2. ACS 2024.
-3. BRFSS 2023.
-
-
-### 10.1. Política de reemplazo
-
-Los tres procesos implementan una política de protección de datos:
-
-- Si la tabla está vacía, permiten la carga inicial.
-- Si contiene registros y no se utiliza `--replace`, detienen la ejecución.
-- Si se utiliza `--replace`, reemplazan los registros existentes dentro de una transacción.
-- Si ocurre un error durante la transacción, los cambios se revierten.
-
-
-**Advertencia:** `--replace` reemplaza los registros de la tabla correspondiente. Debe utilizarse únicamente cuando se desea ejecutar una recarga completa.
-
-## 11. Presupuesto de almacenamiento Silver
-
-El proyecto establece un límite máximo de **100.000 celdas lógicas** para la capa Silver.
-
-El control se implementa en `scripts/silver_budget.py`.
-
-### 11.1. Distribución del presupuesto
-
-| Dataset | Registros | Celdas lógicas por registro | Total |
-|---|---:|---:|---:|
-| PLACES 2023 | 2.490 | 9 | 22.410 |
-| BRFSS 2023 | 2.800 | 24 | 67.200 |
-| ACS 2024 | 113 | 7 | 791 |
-| **Total** | **5.403** | | **90.401** |
-
-### 11.2. Capacidad
-
-- Capacidad máxima: 100.000 celdas.
-- Consumo: 90.401 celdas.
-- Capacidad disponible: 9.599 celdas.
-- Porcentaje utilizado: 90,401 %.
-
-En BRFSS se contabilizan cuatro campos escalares por registro (`respondent_id`, `state_code`, `sequence_number` y `run_id`), más veinte claves almacenadas en JSONB.
-
-El contenedor JSONB no se contabiliza como una celda adicional.
-
-El control presupuestario utiliza un bloqueo transaccional de PostgreSQL para evitar que cargas concurrentes excedan el límite establecido.
-
-## 12. Validaciones
-
-La tabla `etl_runs` permite verificar el resultado de cada ejecución y su cantidad de registros procesados y cargados.
+**Resultado:** las tres bases de datos —original, Medium y Poor— fueron generadas correctamente, con controles de integridad y validaciones posteriores satisfactorias.

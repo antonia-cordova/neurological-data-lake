@@ -169,35 +169,184 @@ def eligible(c,s,t,col,keys,reserved):
         sql.SQL(",").join(map(sql.Identifier,names)),qt(s,t),sql.Identifier(col))).fetchall()
     return [r for r in rows if cell_id(s,t,keys,r[:len(keys)],col) not in reserved]
 
-def plan_rule(c,cfg,level,s,t,col,kind,rate,minimum,rng,reserved):
-    name=f"{s}.{t}"; info=colinfo(c,s,t)
-    if col not in info: return [],dict(table=name,column=col,dimension=dimension(kind),eligible=0,target=0,planned=0,status="COLUMN_MISSING",reason="Columna inexistente")
-    keys,fks,uniques=protections(c,s,t)
-    key_order=pkcols(c,s,t)
-    if not key_order: return [],dict(table=name,column=col,dimension=dimension(kind),eligible=0,target=0,planned=0,status="NO_PRIMARY_KEY",reason="Sin PK")
-    if col in keys or col in uniques: return [],dict(table=name,column=col,dimension=dimension(kind),eligible=0,target=0,planned=0,status="UNIQUE_PROTECTED",reason="Participa en PK/índice UNIQUE")
-    if col in fks: return [],dict(table=name,column=col,dimension=dimension(kind),eligible=0,target=0,planned=0,status="FK_PROTECTED",reason="Participa en FK")
-    if kind=="null" and info[col]!="YES": return [],dict(table=name,column=col,dimension="completeness",eligible=0,target=0,planned=0,status="NOT_NULL_PROTECTED",reason="Columna NOT NULL")
-    rows=eligible(c,s,t,col,key_order,reserved); n=len(rows); target=rate_count(n,rate,minimum)
-    if not target: return [],dict(table=name,column=col,dimension=dimension(kind),eligible=n,target=0,planned=0,status="NO_ELIGIBLE_ROWS",reason="Sin valores elegibles")
-    chosen=rng.sample(rows,min(target,n)); changes=[]
-    for r in chosen:
-        vals=tuple(r[:len(key_order)]); old=r[len(key_order)]
-        if kind=="null": new=None; rule="null_injection"
-        elif kind in ("percent","positive","brfss","latitude","longitude"):
-            new=num_new(old,kind,level,rng)
-            if new is None: continue
-            rule=f"numeric_{kind}"
+
+def plan_rule(c, cfg, level, s, t, col, kind, rate, minimum, rng, reserved):
+    name = f"{s}.{t}"
+    info = colinfo(c, s, t)
+
+    if col not in info:
+        return [], dict(
+            table=name,
+            column=col,
+            dimension=dimension(kind),
+            eligible=0,
+            target=0,
+            planned=0,
+            status="COLUMN_MISSING",
+            reason="Columna inexistente"
+        )
+
+    keys, fks, uniques = protections(c, s, t)
+    key_order = pkcols(c, s, t)
+
+    if not key_order:
+        return [], dict(
+            table=name,
+            column=col,
+            dimension=dimension(kind),
+            eligible=0,
+            target=0,
+            planned=0,
+            status="NO_PRIMARY_KEY",
+            reason="Sin PK"
+        )
+
+    if col in keys or col in uniques:
+        return [], dict(
+            table=name,
+            column=col,
+            dimension=dimension(kind),
+            eligible=0,
+            target=0,
+            planned=0,
+            status="UNIQUE_PROTECTED",
+            reason="Participa en PK/índice UNIQUE"
+        )
+
+    if col in fks:
+        return [], dict(
+            table=name,
+            column=col,
+            dimension=dimension(kind),
+            eligible=0,
+            target=0,
+            planned=0,
+            status="FK_PROTECTED",
+            reason="Participa en FK"
+        )
+
+    if kind == "null" and info[col] != "YES":
+        return [], dict(
+            table=name,
+            column=col,
+            dimension="completeness",
+            eligible=0,
+            target=0,
+            planned=0,
+            status="NOT_NULL_PROTECTED",
+            reason="Columna NOT NULL"
+        )
+
+    # Obtener todas las filas elegibles, excluyendo celdas
+    # que ya fueron reservadas por otra regla.
+    rows = eligible(c, s, t, col, key_order, reserved)
+
+    n = len(rows)
+    target = rate_count(n, rate, minimum)
+
+    if not target:
+        return [], dict(
+            table=name,
+            column=col,
+            dimension=dimension(kind),
+            eligible=n,
+            target=0,
+            planned=0,
+            status="NO_ELIGIBLE_ROWS",
+            reason="Sin valores elegibles"
+        )
+
+    # CAMBIO PRINCIPAL:
+    # Se genera una permutación aleatoria de todas las filas.
+    # No se limita la selección inicial al número objetivo.
+    candidates = rng.sample(rows, len(rows))
+
+    changes = []
+
+    for r in candidates:
+
+        # Detenerse solamente cuando se alcanza el objetivo.
+        if len(changes) >= target:
+            break
+
+        vals = tuple(r[:len(key_order)])
+        old = r[len(key_order)]
+
+        if kind == "null":
+            new = None
+            rule = "null_injection"
+
+        elif kind in (
+            "percent",
+            "positive",
+            "brfss",
+            "latitude",
+            "longitude"
+        ):
+            new = num_new(old, kind, level, rng)
+
+            # Si no existe un cambio válido, continuar
+            # buscando otra fila elegible.
+            if new is None:
+                continue
+
+            rule = f"numeric_{kind}"
+
         else:
-            opts=[x for x in kind if x is not None and str(x)!=str(old)]
-            if not opts: continue
-            new=rng.choice(opts); rule="semantic_category_swap"
-        changes.append(mkchange(cfg,level,s,t,key_order,vals,col,old,new,rule,dimension(kind)))
-        reserved.add(cell_id(s,t,key_order,vals,col))
-    status="PLANNED" if len(changes)==target else "PLANNED_PARTIAL"
-    return changes,dict(table=name,column=col,dimension=dimension(kind),eligible=n,target=target,
-                        planned=len(changes),status=status,
-                        reason="" if status=="PLANNED" else "Algunos valores no admitieron cambio distinto")
+            opts = [
+                x for x in kind
+                if x is not None and str(x) != str(old)
+            ]
+
+            if not opts:
+                continue
+
+            new = rng.choice(opts)
+            rule = "semantic_category_swap"
+
+        changes.append(
+            mkchange(
+                cfg,
+                level,
+                s,
+                t,
+                key_order,
+                vals,
+                col,
+                old,
+                new,
+                rule,
+                dimension(kind)
+            )
+        )
+
+        # Reservar únicamente las celdas efectivamente modificadas.
+        reserved.add(
+            cell_id(s, t, key_order, vals, col)
+        )
+
+    planned = len(changes)
+
+    if planned == target:
+        status = "PLANNED"
+        reason = ""
+    else:
+        status = "PLANNED_PARTIAL"
+        reason = (
+            f"Objetivo: {target}; cambios válidos: {planned}; "
+            f"candidatos elegibles revisados: {n}"
+        )
+
+    return changes, dict(
+        table=name,
+        column=col,
+        dimension=dimension(kind),
+        eligible=n,
+        target=target,
+        planned=planned,
+        status=status,
+        reason=reason
+    )
 
 def plan_fk_semantics(c,cfg,level,rate,minimum,rng,reserved):
     rows=c.execute("""SELECT f.integrated_fact_key,f.source_run_id,f.geography_key,

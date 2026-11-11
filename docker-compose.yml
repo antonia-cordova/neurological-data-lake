@@ -1,7 +1,6 @@
 ﻿services:
   postgres:
     image: postgres:17
-    container_name: neurological_data_lake_postgres
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:?Define POSTGRES_DB en .env}
