@@ -12,12 +12,8 @@ ALLOWED_PORT = 5432
 
 SCHEMA_FILES = [
     ROOT / "sql" / "silver" / "schema_silver.sql",
-    ROOT / "sql" / "silver" / "09_create_silver_acs_county_2024.sql",
 
     ROOT / "sql" / "gold" / "schema_gold.sql",
-    ROOT / "sql" / "gold" / "schema_gold_acs.sql",
-    ROOT / "sql" / "gold" / "schema_gold_brfss.sql",
-    ROOT / "sql" / "gold" / "schema_gold_integrated.sql",
 ]
 
 EXPECTED_TABLES = [
