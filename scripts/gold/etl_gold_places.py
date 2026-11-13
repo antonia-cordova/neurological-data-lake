@@ -1,14 +1,15 @@
 ﻿from __future__ import annotations
-
+from scripts.gold.db_connection import create_gold_engine
 import argparse
 import logging
+import os
 from pathlib import Path
-
-from scripts.gold.db_connection import create_gold_engine
+from dotenv import load_dotenv
+from sqlalchemy import URL, create_engine, text
+from sqlalchemy.engine import Engine
 from scripts.gold.silver_run_validator import resolve_single_silver_run_id
-from sqlalchemy import text
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 SOURCE_TABLE = "silver_places_2023"
 TARGET_TABLE = "gold.fact_area_health"
@@ -29,11 +30,16 @@ logging.basicConfig(
 logger = logging.getLogger("etl_gold_places")
 
 
+
+def create_db_engine() -> Engine:
+    return create_gold_engine()
+
+
 def resolve_source_run_id(
     conn,
     requested_run_id: int | None = None,
 ) -> int:
-    """Selecciona y valida una ejecuciÃ³n Silver de PLACES."""
+    """Selecciona y valida una ejecuciÃƒÂ³n Silver de PLACES."""
 
     run_id = resolve_single_silver_run_id(
         conn,
@@ -70,7 +76,7 @@ def validate_source_run(conn, source_run_id: int) -> dict:
 
     if run is None:
         raise ValueError(
-            f"No existe la ejecuciÃ³n ETL run_id={source_run_id}."
+            f"No existe la ejecuciÃƒÂ³n ETL run_id={source_run_id}."
         )
 
     if run["dataset_name"] != DATASET_NAME:
@@ -85,7 +91,7 @@ def validate_source_run(conn, source_run_id: int) -> dict:
 
     if run["status"] != "succeeded":
         raise ValueError(
-            f"La ejecuciÃ³n {source_run_id} no terminÃ³ correctamente."
+            f"La ejecuciÃƒÂ³n {source_run_id} no terminÃƒÂ³ correctamente."
         )
 
     return dict(run)
@@ -94,7 +100,7 @@ def validate_source_run(conn, source_run_id: int) -> dict:
 def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
     expected_run_id = source_run["run_id"]
 
-    # Evitar que otra ejecuciÃ³n ETL reemplace Silver
+    # Evitar que otra ejecuciÃƒÂ³n ETL reemplace Silver
     # mientras Gold valida y consume los registros.
     conn.execute(text("""
         LOCK TABLE public.silver_places_2023 IN SHARE MODE
@@ -124,10 +130,10 @@ def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
         or lineage["max_run_id"] != expected_run_id
     ):
         raise ValueError(
-            "La trazabilidad de Silver no coincide con la ejecuciÃ³n "
+            "La trazabilidad de Silver no coincide con la ejecuciÃƒÂ³n "
             f"solicitada. Esperado run_id={expected_run_id}; "
             f"resultado={dict(lineage)}. "
-            "No se cargarÃ¡ Gold."
+            "No se cargarÃƒÂ¡ Gold."
         )
 
     # LEER REGISTROS SILVER
@@ -143,7 +149,8 @@ def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
                 data_value_type,
                 data_value,
                 latitude,
-                longitude
+                longitude,
+                reference_year
             FROM public.silver_places_2023
             WHERE run_id = :run_id
             ORDER BY location_id, measure_id, data_value_type
@@ -159,8 +166,15 @@ def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
 
     if len(records) != source_run["loaded_rows"]:
         raise ValueError(
-            "El nÃºmero de filas Silver no coincide con loaded_rows "
+            "El nÃƒÂºmero de filas Silver no coincide con loaded_rows "
             f"del run_id={expected_run_id}."
+        )
+
+    years = {int(row["reference_year"]) for row in records if row["reference_year"] is not None}
+    if len(years) != 1 or years != {2023} or any(row["reference_year"] is None for row in records):
+        raise ValueError(
+            "Silver PLACES debe contener exclusivamente reference_year=2023 "
+            f"para run_id={expected_run_id}; años={sorted(years)}."
         )
 
     # VALIDAR DIMENSIONES
@@ -171,7 +185,7 @@ def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
 
     if len(geographies) != EXPECTED_GEOGRAPHIES:
         raise ValueError(
-            f"GeografÃ­as encontradas: {len(geographies)}; "
+            f"GeografÃƒÂ­as encontradas: {len(geographies)}; "
             f"esperadas: {EXPECTED_GEOGRAPHIES}."
         )
 
@@ -198,7 +212,7 @@ def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
 
     if len(natural_keys) != len(records):
         raise ValueError(
-            "Silver contiene combinaciones geografÃ­a-indicador-tipo duplicadas."
+            "Silver contiene combinaciones geografÃƒÂ­a-indicador-tipo duplicadas."
         )
 
     for row in records:
@@ -250,7 +264,7 @@ def load_dimensions(conn, records: list[dict]) -> tuple[dict, dict, dict]:
         )
 
     # --------------------------------------------------------
-    # 2. Construir geografÃ­as de condado desde PLACES
+    # 2. Construir geografÃƒÂ­as de condado desde PLACES
     # --------------------------------------------------------
     geographies = {}
 
@@ -259,14 +273,14 @@ def load_dimensions(conn, records: list[dict]) -> tuple[dict, dict, dict]:
 
         if not raw_location_id.isdigit() or len(raw_location_id) > 5:
             raise ValueError(
-                f"FIPS de condado invÃ¡lido: {raw_location_id!r}."
+                f"FIPS de condado invÃƒÂ¡lido: {raw_location_id!r}."
             )
 
         county_fips = raw_location_id.zfill(5)
         state_fips = county_fips[:2]
 
         if len(county_fips) != 5:
-            raise ValueError(f"FIPS invÃ¡lido: {county_fips}.")
+            raise ValueError(f"FIPS invÃƒÂ¡lido: {county_fips}.")
 
         parent = states_by_fips.get(state_fips)
 
@@ -278,7 +292,7 @@ def load_dimensions(conn, records: list[dict]) -> tuple[dict, dict, dict]:
 
         if row["state_abbr"] != parent["state_abbr"]:
             raise ValueError(
-                f"Inconsistencia geogrÃ¡fica para {county_fips}: "
+                f"Inconsistencia geogrÃƒÂ¡fica para {county_fips}: "
                 f"PLACES indica {row['state_abbr']}, pero Gold "
                 f"asocia el FIPS {state_fips} a "
                 f"{parent['state_abbr']}."
@@ -301,7 +315,7 @@ def load_dimensions(conn, records: list[dict]) -> tuple[dict, dict, dict]:
 
         if previous is not None and previous != candidate:
             raise ValueError(
-                f"Datos geogrÃ¡ficos inconsistentes para {county_fips}."
+                f"Datos geogrÃƒÂ¡ficos inconsistentes para {county_fips}."
             )
 
         geographies[county_fips] = candidate
@@ -343,7 +357,7 @@ def load_dimensions(conn, records: list[dict]) -> tuple[dict, dict, dict]:
     )
 
     # --------------------------------------------------------
-    # 4. Recuperar y validar las geografÃ­as existentes
+    # 4. Recuperar y validar las geografÃƒÂ­as existentes
     # --------------------------------------------------------
     geography_rows = conn.execute(text("""
         SELECT
@@ -371,8 +385,8 @@ def load_dimensions(conn, records: list[dict]) -> tuple[dict, dict, dict]:
 
     if len(geography_map) != len(geographies):
         raise ValueError(
-            "No se pudieron recuperar todas las geografÃ­as "
-            "de PLACES despuÃ©s de su inserciÃ³n."
+            "No se pudieron recuperar todas las geografÃƒÂ­as "
+            "de PLACES despuÃƒÂ©s de su inserciÃƒÂ³n."
         )
 
     for location_id, candidate in geographies.items():
@@ -386,7 +400,7 @@ def load_dimensions(conn, records: list[dict]) -> tuple[dict, dict, dict]:
                 raise ValueError(
                     f"Inconsistencia en gold.dim_geography: "
                     f"{column} para FIPS {location_id}. "
-                    "No se modificarÃ¡ la dimensiÃ³n existente."
+                    "No se modificarÃƒÂ¡ la dimensiÃƒÂ³n existente."
                 )
 
     # --------------------------------------------------------
@@ -400,7 +414,7 @@ def load_dimensions(conn, records: list[dict]) -> tuple[dict, dict, dict]:
 
         if measure_id in measures and measures[measure_id] != measure:
             raise ValueError(
-                f"DescripciÃ³n inconsistente para measure_id={measure_id}."
+                f"DescripciÃƒÂ³n inconsistente para measure_id={measure_id}."
             )
 
         measures[measure_id] = measure
@@ -438,7 +452,7 @@ def load_dimensions(conn, records: list[dict]) -> tuple[dict, dict, dict]:
 
         if existing["measure"] != measure:
             raise ValueError(
-                f"CambiÃ³ la descripciÃ³n del indicador {measure_id}."
+                f"CambiÃƒÂ³ la descripciÃƒÂ³n del indicador {measure_id}."
             )
 
     # --------------------------------------------------------
@@ -498,11 +512,11 @@ def load_facts(
 
     if source is None:
         raise ValueError(
-            "No se encontrÃ³ la fuente PLACES en gold.dim_source."
+            "No se encontrÃƒÂ³ la fuente PLACES en gold.dim_source."
         )
 
     # --------------------------------------------------------
-    # 2. Evitar reprocesar una ejecuciÃ³n ya cargada
+    # 2. Evitar reprocesar una ejecuciÃƒÂ³n ya cargada
     # --------------------------------------------------------
     existing = conn.execute(
         text("""
@@ -522,7 +536,7 @@ def load_facts(
             f"Ya existen {existing} hechos para "
             f"source_run_id={source_run_id}. "
             "No se permite duplicar ni sobrescribir "
-            "una versiÃ³n histÃ³rica."
+            "una versiÃƒÂ³n histÃƒÂ³rica."
         )
 
     # --------------------------------------------------------
@@ -559,6 +573,7 @@ def load_facts(
                 row["data_value_type"]
             ],
             "data_value": row["data_value"],
+            "reference_year": row["reference_year"],
         })
 
     if len(payload) != len(records):
@@ -577,6 +592,7 @@ def load_facts(
             geography_key,
             health_measure_key,
             prevalence_type_key,
+            reference_year,
             data_value
         )
         VALUES (
@@ -585,6 +601,7 @@ def load_facts(
             :geography_key,
             :health_measure_key,
             :prevalence_type_key,
+            :reference_year,
             :data_value
         )
     """)
@@ -641,7 +658,7 @@ def load_facts(
     return loaded_rows
 
 def run_etl(source_run_id: int | None = None) -> None:
-    engine = create_gold_engine()
+    engine = create_db_engine()
 
     try:
         with engine.begin() as conn:
@@ -657,7 +674,7 @@ def run_etl(source_run_id: int | None = None) -> None:
             )
 
             logger.info(
-                "EjecuciÃ³n de origen validada | run_id=%s | dataset=%s",
+                "EjecuciÃƒÂ³n de origen validada | run_id=%s | dataset=%s",
                 source_run_id,
                 source_run["dataset_name"],
             )
@@ -665,7 +682,7 @@ def run_etl(source_run_id: int | None = None) -> None:
             records = read_and_validate_silver(conn, source_run)
 
             logger.info(
-                "Silver validado | filas=%s | geografÃ­as=%s | indicadores=%s",
+                "Silver validado | filas=%s | geografÃƒÂ­as=%s | indicadores=%s",
                 len(records),
                 EXPECTED_GEOGRAPHIES,
                 EXPECTED_MEASURES,
@@ -692,7 +709,7 @@ def run_etl(source_run_id: int | None = None) -> None:
             )
 
     except Exception:
-        logger.exception("FallÃ³ el ETL Gold PLACES.")
+        logger.exception("FallÃƒÂ³ el ETL Gold PLACES.")
         raise
 
     finally:
@@ -701,7 +718,7 @@ def run_etl(source_run_id: int | None = None) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Carga histÃ³rica de PLACES desde Silver hacia Gold."
+        description="Carga histÃƒÂ³rica de PLACES desde Silver hacia Gold."
     )
 
     parser.add_argument(
@@ -710,7 +727,7 @@ def main() -> int:
     default=None,
     help=(
         "run_id de Silver. Si se omite, "
-        "se selecciona automÃ¡ticamente la versiÃ³n vigente."
+        "se selecciona automÃƒÂ¡ticamente la versiÃƒÂ³n vigente."
     ),
 )
 

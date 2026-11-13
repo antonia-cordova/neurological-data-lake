@@ -231,6 +231,7 @@ CREATE TABLE IF NOT EXISTS gold.fact_area_health (
     health_measure_key BIGINT NOT NULL,
     prevalence_type_key BIGINT NOT NULL,
 
+    reference_year SMALLINT NOT NULL,
     data_value NUMERIC NOT NULL,
 
     loaded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -269,7 +270,10 @@ CREATE TABLE IF NOT EXISTS gold.fact_area_health (
         ON DELETE RESTRICT,
 
     CONSTRAINT fact_area_health_value_check
-        CHECK (data_value >= 0 AND data_value <= 100)
+        CHECK (data_value >= 0 AND data_value <= 100),
+
+    CONSTRAINT fact_area_health_reference_year_check
+        CHECK (reference_year BETWEEN 1900 AND 2100)
 );
 
 -- ------------------------------------------------------------
@@ -287,6 +291,9 @@ CREATE INDEX IF NOT EXISTS idx_fact_area_health_prevalence
 
 CREATE INDEX IF NOT EXISTS idx_fact_area_health_source_run
     ON gold.fact_area_health(source_run_id);
+
+CREATE INDEX IF NOT EXISTS idx_fact_area_health_reference_year
+    ON gold.fact_area_health(reference_year);
 
 CREATE INDEX IF NOT EXISTS idx_fact_area_health_source
     ON gold.fact_area_health(source_key);
@@ -1037,3 +1044,6 @@ COMMENT ON COLUMN gold.fact_health_integrated.denominator IS
     'Denominador descriptivo de la agregación BRFSS cuando corresponda.';
 
 COMMIT;
+
+COMMENT ON COLUMN gold.fact_area_health.reference_year IS
+    'Observation reference year propagated from Silver; for PLACES 2023 this is 2023.';

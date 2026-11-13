@@ -39,6 +39,7 @@ TARGET_COLUMNS = [
     "data_value",
     "latitude",
     "longitude",
+    "reference_year",
     "run_id",
 ]
 
@@ -276,6 +277,9 @@ def transform_and_sample(source: Path, run_id: int) -> tuple[pd.DataFrame, int, 
         "data_value": pd.Series(index=selected.index, dtype="float64"),
         "latitude": latitude,
         "longitude": longitude,
+        "reference_year": pd.to_numeric(
+            selected["Year"], errors="raise"
+        ).astype("int16"),
     })
 
     # PLACES entrega Data_Value con coma decimal (por ejemplo, "29,9").
@@ -297,6 +301,10 @@ def transform_and_sample(source: Path, run_id: int) -> tuple[pd.DataFrame, int, 
         )
 
     result["data_value"] = data_value_numeric
+    if result["reference_year"].isna().any() or not result["reference_year"].eq(TARGET_YEAR).all():
+        raise ValueError(
+            f"reference_year debe ser {TARGET_YEAR} en todas las filas PLACES."
+        )
     result["run_id"] = run_id  # solo auditoría durante el proceso; no se persiste como columna
     return result, source_rows, year_rows
 
@@ -321,6 +329,7 @@ def validate_target_schema(engine: Engine) -> None:
     "data_value": ("numeric", "YES"),
     "latitude": ("double precision", "YES"),
     "longitude": ("double precision", "YES"),
+    "reference_year": ("smallint", "NO"),
     "run_id": ("bigint", "NO"),
     }
 
@@ -417,6 +426,7 @@ def run_etl(replace: bool = False) -> None:
                     data_value,
                     latitude,
                     longitude,
+                    reference_year,
                     run_id
                 )
             VALUES
@@ -430,6 +440,7 @@ def run_etl(replace: bool = False) -> None:
                     :data_value,
                     :latitude,
                     :longitude,
+                    :reference_year,
                     :run_id
                 )
                 """)

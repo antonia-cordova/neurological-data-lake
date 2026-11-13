@@ -8,7 +8,7 @@ from pathlib import Path
 
 from sqlalchemy import text
 
-from scripts.gold.db_connection import create_gold_engine
+from gold.db_connection import create_gold_engine
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -151,6 +151,8 @@ def inspect_gold_stage(
                     OR fact.data_value IS NULL
                     OR fact.data_value < 0
                     OR fact.data_value > 100
+                    OR fact.reference_year IS NULL
+                    OR fact.reference_year <> 2023
             )
             """,
             {"run_id": run_id, "source_key": source_key},
@@ -434,6 +436,8 @@ def inspect_gold_stage(
                     OR bridge.mapping_key IS NULL
                     OR geography.geography_key IS NULL
                     OR fact.value_numeric IS NULL
+                    OR fact.reference_year IS NULL
+                    OR fact.reference_year <> 2023
                     OR fact.prevalence_type_key IS NULL
                     OR prevalence.prevalence_type_key IS NULL
                     OR geography.geography_level NOT IN ('COUNTY', 'STATE')
@@ -458,6 +462,7 @@ def inspect_gold_stage(
                         fact.geography_key,
                         fact.source_key,
                         fact.source_run_id,
+                        fact.reference_year,
                         fact.health_measure_key,
                         fact.prevalence_type_key,
                         fact.data_value AS value_numeric
@@ -476,6 +481,7 @@ def inspect_gold_stage(
                         geography_key,
                         source_key,
                         source_run_id,
+                        reference_year,
                         health_measure_key,
                         prevalence_type_key,
                         value_numeric

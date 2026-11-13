@@ -21,7 +21,7 @@ CREATE INDEX IF NOT EXISTS idx_etl_runs_status
 
 -- ============================================================
 -- PLACES 2023
--- 10 physical columns (9 data + 1 lineage)
+-- 11 physical columns (10 data + 1 lineage)
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS public.silver_places_2023 (
@@ -34,8 +34,12 @@ CREATE TABLE IF NOT EXISTS public.silver_places_2023 (
     data_value NUMERIC,
     latitude DOUBLE PRECISION,
     longitude DOUBLE PRECISION,
+    reference_year SMALLINT NOT NULL,
     run_id BIGINT NOT NULL
         REFERENCES public.etl_runs(run_id),
+
+    CONSTRAINT silver_places_2023_reference_year_check
+        CHECK (reference_year BETWEEN 1900 AND 2100),
 
     CONSTRAINT silver_places_2023_pkey
         PRIMARY KEY (location_id, measure_id, data_value_type)
@@ -49,6 +53,9 @@ CREATE INDEX IF NOT EXISTS idx_silver_places_2023_measure
 
 CREATE INDEX IF NOT EXISTS idx_silver_places_2023_run_id
     ON public.silver_places_2023 (run_id);
+
+CREATE INDEX IF NOT EXISTS idx_silver_places_2023_reference_year
+    ON public.silver_places_2023 (reference_year);
 
 
 -- ============================================================
@@ -165,7 +172,10 @@ COMMENT ON TABLE public.etl_runs IS
     'Audit log for dataset ETL executions. One row per execution.';
 
 COMMENT ON TABLE public.silver_places_2023 IS
-    'Compact PLACES 2023 Silver dataset with ETL run-level lineage.';
+    'Compact PLACES Silver dataset filtered to reference year 2023, with ETL run-level lineage.';
+
+COMMENT ON COLUMN public.silver_places_2023.reference_year IS
+    'Observation reference year preserved from the original Bronze Year column.';
 
 COMMENT ON TABLE public.silver_brfss_2023 IS
     'BRFSS 2023 sample. Selected variables stored in JSONB.';

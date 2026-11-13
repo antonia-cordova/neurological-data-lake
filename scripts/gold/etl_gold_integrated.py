@@ -242,6 +242,8 @@ def validate_base_places_facts(
         SELECT
             COUNT(*) AS total_rows,
             COUNT(DISTINCT fact.geography_key) AS geographies,
+            COUNT(*) FILTER (WHERE fact.reference_year = 2023) AS rows_year_2023,
+            COUNT(*) FILTER (WHERE fact.reference_year IS NULL OR fact.reference_year <> 2023) AS invalid_reference_year,
             COUNT(DISTINCT fact.health_measure_key) AS measures,
             COUNT(DISTINCT fact.prevalence_type_key) AS prevalence_types,
 
@@ -280,6 +282,8 @@ def validate_base_places_facts(
     expected_base = {
         "total_rows": 2490,
         "geographies": 83,
+        "rows_year_2023": 2490,
+        "invalid_reference_year": 0,
         "measures": 15,
         "prevalence_types": 2,
         "invalid_values": 0,
@@ -493,7 +497,7 @@ def load_integrated_places_facts(
                 fact.geography_key,
                 fact.source_key,
                 fact.source_run_id,
-                NULL::smallint,
+                fact.reference_year,
                 geography.geography_level,
                 fact.health_measure_key,
                 NULL,
@@ -561,6 +565,8 @@ def load_integrated_places_facts(
               AND (
                     bridge.mapping_key IS NULL
                     OR integrated.value_numeric IS NULL
+                    OR integrated.reference_year IS NULL
+                    OR integrated.reference_year <> 2023
                     OR integrated.geography_level NOT IN ('COUNTY', 'STATE')
                     OR integrated.prevalence_type_key IS NULL
                   )
@@ -583,6 +589,7 @@ def load_integrated_places_facts(
                     fact.geography_key,
                     fact.source_key,
                     fact.source_run_id,
+                    fact.reference_year,
                     fact.health_measure_key,
                     fact.prevalence_type_key,
                     fact.data_value AS value_numeric
@@ -600,6 +607,7 @@ def load_integrated_places_facts(
                     geography_key,
                     source_key,
                     source_run_id,
+                    reference_year,
                     health_measure_key,
                     prevalence_type_key,
                     value_numeric
