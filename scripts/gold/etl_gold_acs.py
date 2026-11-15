@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager, nullcontext
 import logging
 import re
 from decimal import Decimal, InvalidOperation
@@ -22,6 +23,10 @@ EXPECTED_ROOT_SOURCE_ROW_ID = 109
 
 INSERT_BATCH_SIZE = 100
 
+# Debe coincidir con el bloqueo global de scripts/run_gold_pipeline.py.
+GOLD_PIPELINE_LOCK_KEY = 78_115_004_452_421
+DATABASE_ALLOWED = "health_datalake"
+
 INDENT_CHARS = " \t\u00a0"
 
 logging.basicConfig(
@@ -36,7 +41,7 @@ def resolve_source_run_id(
     conn,
     requested_run_id: int | None = None,
 ) -> int:
-    """Selecciona y valida una ejecuciÃƒÂ³n Silver de ACS nacional."""
+    """Selecciona y valida una ejecución Silver de ACS nacional."""
 
     run_id = resolve_single_silver_run_id(
         conn,
@@ -73,7 +78,7 @@ def validate_source_run(conn, source_run_id: int) -> dict:
 
     if run is None:
         raise ValueError(
-            f"No existe la ejecuciÃƒÂ³n run_id={source_run_id}."
+            f"No existe la ejecución run_id={source_run_id}."
         )
 
     if run["dataset_name"] != DATASET_NAME:
@@ -88,7 +93,7 @@ def validate_source_run(conn, source_run_id: int) -> dict:
 
     if run["status"] != "succeeded":
         raise ValueError(
-            "La ejecuciÃƒÂ³n de Silver no terminÃƒÂ³ correctamente."
+            "La ejecución de Silver no terminó correctamente."
         )
 
     if run["source_rows"] != EXPECTED_SOURCE_ROWS:
@@ -108,11 +113,11 @@ def validate_source_run(conn, source_run_id: int) -> dict:
 
 def parse_numeric(raw_value: str | None) -> Decimal | None:
     """
-    Convierte valores numÃƒÂ©ricos ACS sin alterar la columna raw.
+    Convierte valores numéricos ACS sin alterar la columna raw.
 
-    Admite separadores de miles correctamente agrupados, el prefijo Ã‚Â±
-    utilizado en mÃƒÂ¡rgenes de error y el sufijo % utilizado en porcentajes.
-    Los marcadores estadÃƒÂ­sticos se conservan en raw y se representan como NULL.
+    Admite separadores de miles correctamente agrupados, el prefijo ±
+    utilizado en márgenes de error y el sufijo % utilizado en porcentajes.
+    Los marcadores estadísticos se conservan en raw y se representan como NULL.
     """
     if raw_value is None or raw_value.strip() == "":
         return None
@@ -128,12 +133,12 @@ def parse_numeric(raw_value: str | None) -> Decimal | None:
     if value.endswith("%"):
         value = value[:-1].strip()
 
-    # No eliminar sÃƒÂ­mbolos de forma indiscriminada: una cadena mal formada
-    # debe rechazarse, no convertirse silenciosamente en otro nÃƒÂºmero.
+    # No eliminar símbolos de forma indiscriminada: una cadena mal formada
+    # debe rechazarse, no convertirse silenciosamente en otro número.
     numeric_pattern = r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
     if not re.fullmatch(numeric_pattern, value):
         raise ValueError(
-            f"Formato numÃƒÂ©rico ACS no reconocido: {raw_value!r}"
+            f"Formato numérico ACS no reconocido: {raw_value!r}"
         )
 
     try:
@@ -145,7 +150,7 @@ def parse_numeric(raw_value: str | None) -> Decimal | None:
 
 def indentation_and_label(label: str) -> tuple[int, str]:
     """
-    Conserva el nÃƒÂºmero original de caracteres de indentaciÃƒÂ³n.
+    Conserva el número original de caracteres de indentación.
     No utiliza strip() sobre el valor almacenado.
     """
     indentation = len(label) - len(label.lstrip(INDENT_CHARS))
@@ -157,7 +162,7 @@ def indentation_and_label(label: str) -> tuple[int, str]:
 def classify_percent(raw_value: str | None) -> tuple:
     """
     Devuelve:
-    (tipo, porcentaje_numÃƒÂ©rico, conteo_numÃƒÂ©rico)
+    (tipo, porcentaje_numérico, conteo_numérico)
     """
     if raw_value is None or raw_value.strip() == "":
         return "NULL", None, None
@@ -224,7 +229,7 @@ def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
         or lineage["rows_with_estimate"] != EXPECTED_FACT_ROWS
     ):
         raise ValueError(
-            f"ValidaciÃƒÂ³n de Silver incorrecta para run_id={run_id}: "
+            f"Validación de Silver incorrecta para run_id={run_id}: "
             f"{dict(lineage)}"
         )
 
@@ -293,7 +298,7 @@ def load_dimensions(conn, records: list[dict], source_run_id: int):
 
         if not normalized:
             raise ValueError(
-                f"Etiqueta vacÃƒÂ­a en acs_row_id={row['acs_row_id']}."
+                f"Etiqueta vacía en acs_row_id={row['acs_row_id']}."
             )
 
         is_section = (
@@ -311,7 +316,7 @@ def load_dimensions(conn, records: list[dict], source_run_id: int):
             "is_section": is_section,
         })
 
-    # No sobrescribir dimensiones histÃƒÂ³ricas
+    # No sobrescribir dimensiones históricas
     existing = conn.execute(
         text("""
             SELECT COUNT(*)
@@ -324,7 +329,7 @@ def load_dimensions(conn, records: list[dict], source_run_id: int):
     if existing:
         raise RuntimeError(
             f"Ya existen {existing} indicadores para run_id={source_run_id}. "
-            "No se sobrescriben versiones histÃƒÂ³ricas."
+            "No se sobrescriben versiones históricas."
         )
 
     conn.execute(
@@ -368,7 +373,7 @@ def load_dimensions(conn, records: list[dict], source_run_id: int):
 
     if len(dimension_rows) != EXPECTED_SOURCE_ROWS:
         raise RuntimeError(
-            f"DimensiÃƒÂ³n ACS incompleta: {len(dimension_rows)} filas; "
+            f"Dimensión ACS incompleta: {len(dimension_rows)} filas; "
             f"se esperaban {EXPECTED_SOURCE_ROWS}."
         )
 
@@ -378,7 +383,7 @@ def load_dimensions(conn, records: list[dict], source_run_id: int):
 
     if dimension_section_count != EXPECTED_SECTION_ROWS:
         raise RuntimeError(
-            f"La dimensiÃƒÂ³n contiene {dimension_section_count} secciones; "
+            f"La dimensión contiene {dimension_section_count} secciones; "
             f"se esperaban {EXPECTED_SECTION_ROWS}."
         )
 
@@ -405,12 +410,12 @@ def load_dimensions(conn, records: list[dict], source_run_id: int):
 
         if row["is_section"] and current_indent != 0:
             raise ValueError(
-                "Una secciÃƒÂ³n ACS debe encontrarse en el nivel raÃƒÂ­z: "
+                "Una sección ACS debe encontrarse en el nivel raíz: "
                 f"source_row_id={row['source_row_id']}."
             )
 
-        # Un indicador puede ser raÃƒÂ­z y no tener padre.
-        # Se conserva la jerarquÃƒÂ­a cuando existe un padre.
+        # Un indicador puede ser raíz y no tener padre.
+        # Se conserva la jerarquía cuando existe un padre.
 
         parent_updates.append({
             "indicator_key": row["indicator_key"],
@@ -491,12 +496,12 @@ def load_dimensions(conn, records: list[dict], source_run_id: int):
         for key, expected in expected_hierarchy.items()
     ):
         raise RuntimeError(
-            "JerarquÃƒÂ­a ACS invÃƒÂ¡lida: "
+            "Jerarquía ACS inválida: "
             f"{dict(hierarchy_validation)}"
         )
 
     logger.info(
-        "DimensiÃƒÂ³n ACS validada | indicadores=%s | secciones=%s",
+        "Dimensión ACS validada | indicadores=%s | secciones=%s",
         hierarchy_validation["total_rows"],
         hierarchy_validation["section_rows"],
     )
@@ -523,7 +528,7 @@ def load_facts(
 
     if source_key is None:
         raise ValueError(
-            "No se encontrÃƒÂ³ ACS en gold.dim_source."
+            "No se encontró ACS en gold.dim_source."
         )
 
     existing = conn.execute(
@@ -579,7 +584,7 @@ def load_facts(
     for row in records:
         estimate_raw = row["estimate"]
 
-        # Las cinco filas de encabezados se conservan en la dimensiÃƒÂ³n, no generan hechos estadÃƒÂ­sticos
+        # Las cinco filas de encabezados se conservan en la dimensión, no generan hechos estadísticos
         if estimate_raw is None or estimate_raw.strip() == "":
             continue
 
@@ -594,7 +599,7 @@ def load_facts(
 
         if estimate_numeric is not None and estimate_numeric < 0:
             raise ValueError(
-                "EstimaciÃƒÂ³n ACS negativa en DP05: "
+                "Estimación ACS negativa en DP05: "
                 f"acs_row_id={row['acs_row_id']}, valor={estimate_raw!r}."
             )
 
@@ -651,7 +656,7 @@ def load_facts(
 
     if loaded != EXPECTED_FACT_ROWS or persisted != EXPECTED_FACT_ROWS:
         raise RuntimeError(
-            f"ValidaciÃƒÂ³n fallida: insertados={loaded}, "
+            f"Validación fallida: insertados={loaded}, "
             f"persistidos={persisted}, esperados={EXPECTED_FACT_ROWS}."
         )
 
@@ -659,11 +664,106 @@ def load_facts(
 
 
 
-def run_etl(source_run_id: int | None = None):
+
+def validate_orchestrator_lock(engine) -> None:
+    """Confirma que el proceso padre mantiene el bloqueo global compartido."""
+    with engine.connect() as conn:
+        held = conn.execute(
+            text("""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_locks
+                    WHERE locktype = 'advisory'
+                      AND granted
+                      AND pid <> pg_backend_pid()
+                      AND classid = (:lock_key >> 32)::oid
+                      AND objid = (:lock_key & 4294967295)::oid
+                      AND objsubid = 1
+                )
+            """),
+            {"lock_key": GOLD_PIPELINE_LOCK_KEY},
+        ).scalar_one()
+
+    if not held:
+        raise RuntimeError(
+            "Se indicó --orchestrated, pero no se detectó el bloqueo global "
+            "Gold del proceso padre. Se cancela para evitar una ejecución "
+            "sin exclusión mutua."
+        )
+
+
+@contextmanager
+def acquire_acs_execution_lock():
+    """Serializa ACS independiente frente al pipeline Gold completo."""
+    engine = create_gold_engine()
+    conn = None
+    acquired = False
+
+    try:
+        conn = engine.connect()
+        database = conn.execute(
+            text("SELECT current_database()")
+        ).scalar_one()
+
+        if database != DATABASE_ALLOWED:
+            raise RuntimeError(
+                f"ETL ACS bloqueado: base de datos no autorizada ({database})."
+            )
+
+        acquired = bool(
+            conn.execute(
+                text("SELECT pg_try_advisory_lock(:lock_key)"),
+                {"lock_key": GOLD_PIPELINE_LOCK_KEY},
+            ).scalar_one()
+        )
+        conn.commit()
+
+        if not acquired:
+            raise RuntimeError(
+                "Existe un pipeline Gold u otra ejecución ACS en curso. "
+                "No se iniciará una ejecución concurrente."
+            )
+
+        logger.info("Bloqueo compartido de ejecución Gold adquirido por ACS.")
+        yield
+    finally:
+        if conn is not None:
+            if acquired:
+                try:
+                    conn.execute(
+                        text("SELECT pg_advisory_unlock(:lock_key)"),
+                        {"lock_key": GOLD_PIPELINE_LOCK_KEY},
+                    )
+                    conn.commit()
+                    logger.info("Bloqueo compartido de ejecución Gold liberado.")
+                except Exception:
+                    logger.exception(
+                        "No fue posible liberar el bloqueo; "
+                        "se invalidará la conexión."
+                    )
+                    conn.invalidate()
+            conn.close()
+        engine.dispose()
+
+
+def run_etl(
+    source_run_id: int | None = None,
+    orchestrated: bool = False,
+):
     engine = create_gold_engine()
 
     try:
-        with engine.begin() as conn:
+        if orchestrated:
+            validate_orchestrator_lock(engine)
+            logger.info(
+                "Bloqueo global del orquestador verificado; "
+                "ACS no adquiere un segundo lock."
+            )
+            lock_context = nullcontext()
+        else:
+            lock_context = acquire_acs_execution_lock()
+
+        with lock_context, engine.begin() as conn:
 
             source_run_id = resolve_source_run_id(
                 conn,
@@ -717,17 +817,23 @@ def main() -> int:
         default=None,
         help=(
             "run_id de Silver. Si se omite, "
-            "se selecciona automÃƒÂ¡ticamente la versiÃƒÂ³n vigente."
+            "se selecciona automáticamente la versión vigente."
         ),
+    )
+
+    parser.add_argument(
+        "--orchestrated",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
 
     args = parser.parse_args()
 
     try:
-        run_etl(args.source_run_id)
+        run_etl(args.source_run_id, orchestrated=args.orchestrated)
         return 0
     except Exception:
-        logger.exception("FallÃƒÂ³ el ETL Gold ACS.")
+        logger.exception("Falló el ETL Gold ACS.")
         return 1
 
 

@@ -19,135 +19,6 @@ EXPECTED_BASE_ROWS = 2490
 EXPECTED_INTEGRATED_ROWS = 2490
 EXPECTED_MAPPING_ROWS = 15
 
-# Mapeo explÃ­cito de las medidas PLACES a la dimensiÃ³n integrada.
-# MHLTH y PHLTH son relaciones parciales: miden dimensiones especÃ­ficas,
-# no la totalidad de salud mental o salud fÃ­sica, respectivamente.
-PLACES_INDICATOR_MAPPING: tuple[dict[str, str], ...] = (
-    {
-        "measure_id": "ARTHRITIS",
-        "indicator_code": "ARTHRITIS",
-        "relation_type": "DIRECT",
-        "comparability": "COMPARABLE_WITH_CAVEATS",
-        "mapping_notes": "Correspondencia directa. La comparaciÃ³n requiere controlar aÃ±o, poblaciÃ³n, geografÃ­a y tipo de prevalencia.",
-    },
-    {
-        "measure_id": "CHD",
-        "indicator_code": "CORONARY_HEART_DISEASE",
-        "relation_type": "DIRECT",
-        "comparability": "COMPARABLE_WITH_CAVEATS",
-        "mapping_notes": "Correspondencia directa con enfermedad coronaria. Verificar metodologÃ­a, poblaciÃ³n, aÃ±o y tipo de prevalencia.",
-    },
-    {
-        "measure_id": "COGNITION",
-        "indicator_code": "COGNITION",
-        "relation_type": "DIRECT",
-        "comparability": "COMPARABLE_WITH_CAVEATS",
-        "mapping_notes": "Correspondencia directa con discapacidad cognitiva. Verificar metodologÃ­a, poblaciÃ³n, aÃ±o y tipo de prevalencia.",
-    },
-    {
-        "measure_id": "DEPRESSION",
-        "indicator_code": "DEPRESSION",
-        "relation_type": "DIRECT",
-        "comparability": "COMPARABLE_WITH_CAVEATS",
-        "mapping_notes": "Correspondencia directa con depresiÃ³n. Verificar metodologÃ­a, poblaciÃ³n, aÃ±o y tipo de prevalencia.",
-    },
-    {
-        "measure_id": "DIABETES",
-        "indicator_code": "DIABETES",
-        "relation_type": "DIRECT",
-        "comparability": "COMPARABLE_WITH_CAVEATS",
-        "mapping_notes": "Correspondencia directa con diabetes diagnosticada. Verificar metodologÃ­a, poblaciÃ³n, aÃ±o y tipo de prevalencia.",
-    },
-    {
-        "measure_id": "DISABILITY",
-        "indicator_code": "DISABILITY",
-        "relation_type": "DIRECT",
-        "comparability": "COMPARABLE_WITH_CAVEATS",
-        "mapping_notes": "Correspondencia directa con discapacidad. Verificar definiciÃ³n operacional, poblaciÃ³n, aÃ±o y tipo de prevalencia.",
-    },
-    {
-        "measure_id": "GHLTH",
-        "indicator_code": "GENERAL_HEALTH",
-        "relation_type": "DIRECT",
-        "comparability": "COMPARABLE_WITH_CAVEATS",
-        "mapping_notes": "Correspondencia directa con salud general autopercibida. Verificar categorÃ­as, metodologÃ­a, poblaciÃ³n y aÃ±o.",
-    },
-    {
-        "measure_id": "HEARING",
-        "indicator_code": "HEARING",
-        "relation_type": "DIRECT",
-        "comparability": "COMPARABLE_WITH_CAVEATS",
-        "mapping_notes": "Correspondencia directa con discapacidad auditiva. Verificar metodologÃ­a, poblaciÃ³n, aÃ±o y tipo de prevalencia.",
-    },
-    {
-        "measure_id": "INDEPLIVE",
-        "indicator_code": "INDEPLIVE",
-        "relation_type": "DIRECT",
-        "comparability": "COMPARABLE_WITH_CAVEATS",
-        "mapping_notes": "Correspondencia directa con discapacidad para la vida independiente. Verificar definiciÃ³n operacional y poblaciÃ³n.",
-    },
-    {
-        "measure_id": "MHLTH",
-        "indicator_code": "MENTAL_HEALTH",
-        "relation_type": "PARTIAL",
-        "comparability": "NOT_DIRECTLY_COMPARABLE",
-        "mapping_notes": "RelaciÃ³n parcial: PLACES mide malestar mental frecuente, no la totalidad del constructo de salud mental.",
-    },
-    {
-        "measure_id": "MOBILITY",
-        "indicator_code": "MOBILITY",
-        "relation_type": "DIRECT",
-        "comparability": "COMPARABLE_WITH_CAVEATS",
-        "mapping_notes": "Correspondencia directa con discapacidad de movilidad. Verificar metodologÃ­a, poblaciÃ³n, aÃ±o y tipo de prevalencia.",
-    },
-    {
-        "measure_id": "PHLTH",
-        "indicator_code": "PHYSICAL_HEALTH",
-        "relation_type": "PARTIAL",
-        "comparability": "NOT_DIRECTLY_COMPARABLE",
-        "mapping_notes": "RelaciÃ³n parcial: PLACES mide malestar fÃ­sico frecuente, no la totalidad del constructo de salud fÃ­sica.",
-    },
-    {
-        "measure_id": "SELFCARE",
-        "indicator_code": "SELFCARE",
-        "relation_type": "DIRECT",
-        "comparability": "COMPARABLE_WITH_CAVEATS",
-        "mapping_notes": "Correspondencia directa con discapacidad para el autocuidado. Verificar definiciÃ³n operacional y poblaciÃ³n.",
-    },
-    {
-        "measure_id": "STROKE",
-        "indicator_code": "STROKE",
-        "relation_type": "DIRECT",
-        "comparability": "COMPARABLE_WITH_CAVEATS",
-        "mapping_notes": "Correspondencia directa con accidente cerebrovascular. Verificar metodologÃ­a, poblaciÃ³n, aÃ±o y tipo de prevalencia.",
-    },
-    {
-        "measure_id": "VISION",
-        "indicator_code": "VISION",
-        "relation_type": "DIRECT",
-        "comparability": "COMPARABLE_WITH_CAVEATS",
-        "mapping_notes": "Correspondencia directa con discapacidad visual. Verificar metodologÃ­a, poblaciÃ³n, aÃ±o y tipo de prevalencia.",
-    },
-)
-
-MAPPING_VALUES_SQL = ",\n".join(
-    f"(:measure_id_{i}, :indicator_code_{i}, :relation_type_{i}, "
-    f":comparability_{i}, :mapping_notes_{i})"
-    for i in range(len(PLACES_INDICATOR_MAPPING))
-)
-
-MAPPING_PARAMS: dict[str, str] = {
-    f"{field}_{i}": mapping[field]
-    for i, mapping in enumerate(PLACES_INDICATOR_MAPPING)
-    for field in (
-        "measure_id",
-        "indicator_code",
-        "relation_type",
-        "comparability",
-        "mapping_notes",
-    )
-}
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -190,7 +61,7 @@ def resolve_and_validate_places_run(
         or run["loaded_rows"] != EXPECTED_SILVER_ROWS
     ):
         raise ValueError(
-            f"EjecuciÃ³n Silver PLACES invÃ¡lida: run_id={run_id}."
+            f"Ejecución Silver PLACES inválida: run_id={run_id}."
         )
 
     source_key = conn.execute(
@@ -295,7 +166,7 @@ def validate_base_places_facts(
         for key, expected in expected_base.items()
     ):
         raise ValueError(
-            "ValidaciÃ³n estructural de hechos PLACES incorrecta: "
+            "Validación estructural de hechos PLACES incorrecta: "
             f"{dict(base_validation)}"
         )
     
@@ -320,104 +191,15 @@ def validate_base_places_facts(
 
     if gold_measure_count != EXPECTED_MAPPING_ROWS:
         raise ValueError(
-            "gold.dim_health_measure no estÃ¡ completa: "
+            "gold.dim_health_measure no está completa: "
             f"{gold_measure_count}; esperado={EXPECTED_MAPPING_ROWS}. "
             "Ejecute y valide primero etl_gold_places.py."
         )
 
 
-def ensure_places_mappings(conn: Connection, source_key: int) -> None:
-    mapping_source = f"""
-        SELECT
-            v.measure_id,
-            v.indicator_code,
-            v.relation_type,
-            v.comparability,
-            v.mapping_notes,
-            hm.health_measure_key,
-            ii.indicator_key
-        FROM (VALUES {MAPPING_VALUES_SQL}) AS v(
-            measure_id,
-            indicator_code,
-            relation_type,
-            comparability,
-            mapping_notes
-        )
-        JOIN gold.dim_health_measure hm
-          ON hm.measure_id = v.measure_id
-        JOIN gold.dim_health_integrated_indicator ii
-          ON ii.indicator_code = v.indicator_code
-    """
-
-    resolved_count = conn.execute(
-        text(f"SELECT COUNT(*) FROM ({mapping_source}) resolved"),
-        MAPPING_PARAMS,
-    ).scalar_one()
-
-    if resolved_count != EXPECTED_MAPPING_ROWS:
-        raise ValueError(
-            "No se pudieron resolver todas las correspondencias PLACES: "
-            f"{resolved_count}/{EXPECTED_MAPPING_ROWS}. "
-            "Revise dim_health_measure y dim_health_integrated_indicator."
-        )
-
-    # Inserta solo las correspondencias ausentes. Las existentes se validan
-    # posteriormente; no se sobrescriben silenciosamente.
-    conn.execute(
-        text(
-            f"""
-            INSERT INTO gold.bridge_health_indicator_source (
-                indicator_key,
-                source_key,
-                health_measure_key,
-                variable_key,
-                relation_type,
-                comparability,
-                mapping_notes
-            )
-            SELECT
-                resolved.indicator_key,
-                :source_key,
-                resolved.health_measure_key,
-                NULL,
-                resolved.relation_type,
-                resolved.comparability,
-                resolved.mapping_notes
-            FROM ({mapping_source}) resolved
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM gold.bridge_health_indicator_source existing
-                WHERE existing.indicator_key = resolved.indicator_key
-                  AND existing.source_key = :source_key
-                  AND existing.health_measure_key = resolved.health_measure_key
-            )
-            """
-        ),
-        {**MAPPING_PARAMS, "source_key": source_key},
-    )
-
-    # Deben existir exactamente los 15 mapeos previstos y sus atributos
-    # deben coincidir con la definiciÃ³n versionada en este ETL.
-    mismatches = conn.execute(
-        text(
-            f"""
-            SELECT COUNT(*)
-            FROM ({mapping_source}) resolved
-            LEFT JOIN gold.bridge_health_indicator_source existing
-              ON existing.indicator_key = resolved.indicator_key
-             AND existing.source_key = :source_key
-             AND existing.health_measure_key = resolved.health_measure_key
-            WHERE existing.mapping_key IS NULL
-               OR existing.variable_key IS NOT NULL
-               OR existing.relation_type <> resolved.relation_type
-               OR existing.comparability <> resolved.comparability
-               OR existing.mapping_notes IS DISTINCT FROM resolved.mapping_notes
-            """
-        ),
-        {**MAPPING_PARAMS, "source_key": source_key},
-    ).scalar_one()
-
-    total_places_mappings = conn.execute(
+def validate_places_mappings(conn: Connection, source_key: int) -> None:
+    """Valida el catálogo PLACES registrado por la función del esquema Gold."""
+    mapping_count = conn.execute(
         text(
             """
             SELECT COUNT(*)
@@ -430,19 +212,12 @@ def ensure_places_mappings(conn: Connection, source_key: int) -> None:
         {"source_key": source_key},
     ).scalar_one()
 
-    if mismatches != 0 or total_places_mappings != EXPECTED_MAPPING_ROWS:
+    if mapping_count != EXPECTED_MAPPING_ROWS:
         raise ValueError(
-            "El bridge PLACES no coincide con el mapeo esperado: "
-            f"discrepancias={mismatches}, "
-            f"total={total_places_mappings}, "
-            f"esperado={EXPECTED_MAPPING_ROWS}."
+            "El bridge PLACES no está completo: "
+            f"{mapping_count}/{EXPECTED_MAPPING_ROWS}. "
+            "Ejecute el registro de mapeos desde el orquestador."
         )
-
-    logger.info(
-        "Bridge PLACES validado | source_key=%s | mappings=%s",
-        source_key,
-        total_places_mappings,
-    )
 
 
 def load_integrated_places_facts(
@@ -466,7 +241,7 @@ def load_integrated_places_facts(
         raise ValueError(
             "Gold integrado ya contiene "
             f"{existing} filas para PLACES run_id={run_id}; "
-            "se rechaza reprocesar la misma versiÃ³n."
+            "se rechaza reprocesar la misma versión."
         )
 
     conn.execute(
@@ -510,10 +285,10 @@ def load_integrated_places_facts(
                 NULL,
                 NULL,
                 NULL,
-                'CDC PLACES: estimaciÃ³n territorial copiada sin recalcular '
+                'CDC PLACES: estimación territorial copiada sin recalcular '
                 'desde gold.fact_area_health. El valor corresponde a '
-                'prevalencia; la interpretaciÃ³n debe considerar el tipo '
-                'de prevalencia y la metodologÃ­a de origen.'
+                'prevalencia; la interpretación debe considerar el tipo '
+                'de prevalencia y la metodología de origen.'
             FROM gold.fact_area_health fact
             JOIN gold.dim_health_measure measure
               ON measure.health_measure_key = fact.health_measure_key
@@ -544,12 +319,12 @@ def load_integrated_places_facts(
 
     if persisted != EXPECTED_INTEGRATED_ROWS:
         raise RuntimeError(
-            "IntegraciÃ³n PLACES incompleta: "
+            "Integración PLACES incompleta: "
             f"{persisted}; esperado={EXPECTED_INTEGRATED_ROWS}."
         )
 
-    # ValidaciÃ³n adicional del grano: cada fila integrada debe tener
-    # indicador, medida, geografÃ­a y tipo de prevalencia.
+    # Validación adicional del grano: cada fila integrada debe tener
+    # indicador, medida, geografía y tipo de prevalencia.
     invalid_rows = conn.execute(
         text(
             """
@@ -577,7 +352,7 @@ def load_integrated_places_facts(
 
     if invalid_rows:
         raise RuntimeError(
-            "Se detectaron hechos integrados PLACES invÃ¡lidos: "
+            "Se detectaron hechos integrados PLACES inválidos: "
             f"{invalid_rows}."
         )                            
 
@@ -644,7 +419,7 @@ def load_integrated_places_facts(
             f"{dict(equivalence)}"
         )
     logger.info(
-        "IntegraciÃ³n PLACES finalizada | source_run_id=%s | filas=%s",
+        "Integración PLACES finalizada | source_run_id=%s | filas=%s",
         run_id,
         persisted,
     )
@@ -664,7 +439,7 @@ def run_etl(places_run_id: int | None = None) -> None:
             )
 
             validate_base_places_facts(conn, run_id, source_key)
-            ensure_places_mappings(conn, source_key)
+            validate_places_mappings(conn, source_key)
             load_integrated_places_facts(conn, run_id, source_key)
 
             logger.info(
@@ -674,7 +449,7 @@ def run_etl(places_run_id: int | None = None) -> None:
             )
 
     except Exception:
-        logger.exception("FallÃ³ la integraciÃ³n Gold PLACES.")
+        logger.exception("Falló la integración Gold PLACES.")
         raise
     finally:
         engine.dispose()
@@ -691,7 +466,7 @@ def main() -> int:
         "--places-run-id",
         type=int,
         default=None,
-        help="run_id de Silver PLACES. Si se omite, se resuelve automÃ¡ticamente.",
+        help="run_id de Silver PLACES. Si se omite, se resuelve automáticamente.",
     )
 
     args = parser.parse_args()
@@ -700,7 +475,7 @@ def main() -> int:
         run_etl(places_run_id=args.places_run_id)
         return 0
     except Exception:
-        logger.exception("FallÃ³ la integraciÃ³n Gold PLACES.")
+        logger.exception("Falló la integración Gold PLACES.")
         return 1
 
 

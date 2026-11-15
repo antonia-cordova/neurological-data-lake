@@ -14,7 +14,9 @@ from sqlalchemy import bindparam, text
 
 ROOT = Path(__file__).resolve().parents[2]
 
-SOURCE_TABLE = "silver_brfss_2023"
+SOURCE_TABLE = "silver_respondent"
+RESPONSE_TABLE = "silver_brfss_2023"
+SOURCE_RUN_TARGET_TABLE = "silver_respondent+silver_brfss_2023"
 DATASET_NAME = "brfss_2023"
 CODEBOOK_PATH = (
     ROOT / "data" / "bronze" / "brfss_2023" / "USCODE23_LLCP_021924.HTML"
@@ -266,7 +268,7 @@ def resolve_source_run_id(
         requested_run_id=requested_run_id,
         expected_rows=EXPECTED_RESPONDENTS,
         dataset_name=DATASET_NAME,
-        target_table=SOURCE_TABLE,
+        target_table=SOURCE_RUN_TARGET_TABLE,
     )
 
     logger.info(
@@ -286,7 +288,8 @@ def validate_source_run(conn, source_run_id: int) -> dict:
                 target_table,
                 source_rows,
                 loaded_rows,
-                status
+                status,
+                finished_at
             FROM public.etl_runs
             WHERE run_id = :run_id
         """),
@@ -299,11 +302,17 @@ def validate_source_run(conn, source_run_id: int) -> dict:
     if run["dataset_name"] != DATASET_NAME:
         raise ValueError("El dataset de la ejecución no es BRFSS 2023.")
 
-    if run["target_table"] != SOURCE_TABLE:
-        raise ValueError("La tabla de origen no corresponde a Silver BRFSS.")
+    if run["target_table"] != SOURCE_RUN_TARGET_TABLE:
+        raise ValueError(
+            "El destino de la ejecución no corresponde a "
+            "silver_respondent+silver_brfss_2023."
+        )
 
     if run["status"] != "succeeded":
         raise ValueError("La ejecución de Silver no fue exitosa.")
+
+    if run["finished_at"] is None:
+        raise ValueError("La ejecución Silver no tiene finished_at.")
 
     if run["loaded_rows"] != EXPECTED_RESPONDENTS:
         raise ValueError(
@@ -337,7 +346,12 @@ def parse_numeric(variable: str, raw_value: str | None):
         )
 
     if variable == BMI_VARIABLE:
-        if not (Decimal("1") <= value <= Decimal("9999")):
+        # BRFSS usa 9999 como código especial de valor desconocido/rechazado.
+        # Se conserva en raw_value, pero no se transforma en un IMC numérico.
+        if value == Decimal("9999"):
+            return None
+
+        if not (Decimal("1") <= value <= Decimal("9998")):
             raise ValueError(
                 f"_BMI5 fuera de rango: {raw_value}"
             )
@@ -363,56 +377,66 @@ def parse_numeric(variable: str, raw_value: str | None):
 
 
 def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
+    """Lee respuestas y metadatos BRFSS unidos por respondent_id."""
+
     run_id = source_run["run_id"]
 
+    # Evitar que la capa Silver cambie mientras Gold valida y consume.
+    conn.execute(text("""
+        LOCK TABLE public.silver_respondent IN SHARE MODE
+    """))
     conn.execute(text("""
         LOCK TABLE public.silver_brfss_2023 IN SHARE MODE
     """))
 
-    
     lineage = conn.execute(
         text("""
             SELECT
-                COUNT(*) AS total_rows,
-                COUNT(run_id) AS rows_with_run_id,
-                COUNT(DISTINCT run_id) AS distinct_runs,
-                MIN(run_id) AS min_run_id,
-                MAX(run_id) AS max_run_id
-            FROM public.silver_brfss_2023
-            WHERE run_id = :run_id
+                COUNT(*) AS total_respondents,
+                COUNT(respondent.respondent_id) AS respondents_with_id,
+                COUNT(response.respondent_id) AS respondents_with_response,
+                COUNT(DISTINCT respondent.run_id) AS distinct_runs,
+                MIN(respondent.run_id) AS min_run_id,
+                MAX(respondent.run_id) AS max_run_id
+            FROM public.silver_respondent respondent
+            LEFT JOIN public.silver_brfss_2023 response
+                ON response.respondent_id = respondent.respondent_id
+            WHERE respondent.run_id = :run_id
         """),
         {"run_id": run_id},
     ).mappings().one()
 
     if (
-        lineage["total_rows"] != EXPECTED_RESPONDENTS
-        or lineage["rows_with_run_id"] != EXPECTED_RESPONDENTS
+        lineage["total_respondents"] != EXPECTED_RESPONDENTS
+        or lineage["respondents_with_id"] != EXPECTED_RESPONDENTS
+        or lineage["respondents_with_response"] != EXPECTED_RESPONDENTS
         or lineage["distinct_runs"] != 1
         or lineage["min_run_id"] != run_id
         or lineage["max_run_id"] != run_id
     ):
         raise ValueError(
-            f"Trazabilidad Silver incorrecta para run_id={run_id}: "
+            f"Trazabilidad Silver BRFSS incorrecta para run_id={run_id}: "
             f"{dict(lineage)}"
         )
 
     records = conn.execute(
         text("""
             SELECT
-                state_code,
-                sequence_number,
-                record_data,
-                run_id
-            FROM public.silver_brfss_2023
-            WHERE run_id = :run_id
-            ORDER BY state_code, sequence_number
+                respondent.state_fips AS state_code,
+                respondent.sequence_number,
+                response.record_data
+            FROM public.silver_respondent respondent
+            INNER JOIN public.silver_brfss_2023 response
+                ON response.respondent_id = respondent.respondent_id
+            WHERE respondent.run_id = :run_id
+            ORDER BY respondent.state_fips, respondent.sequence_number
         """),
         {"run_id": run_id},
     ).mappings().all()
 
     if len(records) != EXPECTED_RESPONDENTS:
         raise ValueError(
-            f"Silver contiene {len(records)} registros; "
+            f"Silver contiene {len(records)} respuestas BRFSS; "
             f"se esperaban {EXPECTED_RESPONDENTS}."
         )
 
@@ -421,17 +445,21 @@ def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
         key = (row["state_code"], row["sequence_number"])
 
         if not all(key):
-            raise ValueError("Se encontró una clave natural vacía.")
+            raise ValueError("Se encontró una clave natural BRFSS vacía.")
+
+        if not re.fullmatch(r"\d{2}", str(row["state_code"])):
+            raise ValueError(f"FIPS estatal inválido: {row['state_code']!r}")
 
         if key in natural_keys:
-            raise ValueError(f"Clave natural duplicada: {key}")
+            raise ValueError(f"Clave natural BRFSS duplicada: {key}")
 
         natural_keys.add(key)
 
         data = row["record_data"]
-
         if not isinstance(data, dict):
-            raise ValueError("record_data no contiene un objeto JSON.")
+            raise ValueError(
+                f"record_data no contiene un objeto JSON para {key}."
+            )
 
         if set(data.keys()) != set(VARIABLES.keys()):
             raise ValueError(
@@ -439,7 +467,8 @@ def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
             )
 
     logger.info(
-        "Silver validado: %s personas y %s variables.",
+        "Silver validado: %s encuestados, %s respuestas y %s variables.",
+        len(records),
         len(records),
         len(VARIABLES),
     )
@@ -590,33 +619,17 @@ def load_dimensions(conn, records: list[dict]):
     )
 
     # Jurisdicciones observadas en Silver.
-    states = sorted({row["state_code"] for row in records})
+    raw_states = {str(row["state_code"]).strip() for row in records}
+    invalid_states = [
+        state for state in raw_states
+        if not state.isdigit() or not (1 <= len(state) <= 2)
+    ]
+    if invalid_states:
+        raise ValueError(
+            f"Códigos FIPS BRFSS inválidos: {sorted(invalid_states)}"
+        )
 
-    conn.execute(
-        text("""
-            INSERT INTO gold.dim_brfss_jurisdiction (state_code)
-            VALUES (:state_code)
-            ON CONFLICT (state_code) DO NOTHING
-        """),
-        [{"state_code": state} for state in states],
-    )
-
-    jurisdiction_rows = conn.execute(
-        text("""
-            SELECT jurisdiction_key, state_code
-            FROM gold.dim_brfss_jurisdiction
-        """)
-    ).mappings().all()
-
-    jurisdiction_map = {
-    row["state_code"]: row["jurisdiction_key"]
-    for row in jurisdiction_rows
-}
-
-    # --------------------------------------------------------
-    # Puente geográfico BRFSS -> Gold
-    # Correspondencia mediante FIPS estatal.
-    # --------------------------------------------------------
+    states = sorted({state.zfill(2) for state in raw_states})
 
     if len(states) != 52:
         raise ValueError(
@@ -624,19 +637,124 @@ def load_dimensions(conn, records: list[dict]):
             f"se encontraron {len(states)}."
         )
 
-    # Validar que todos los códigos sean FIPS numéricos.
-    invalid_states = [
-        state for state in states
-        if not str(state).strip().isdigit()
-        or not (1 <= len(str(state).strip()) <= 2)
-    ]
+    # Cargar las 52 jurisdicciones desde el catálogo geográfico Gold.
+    # Los nombres se obtienen de la dimensión geográfica para mantener
+    # una única fuente de referencia.
+    conn.execute(
+        text("""
+            INSERT INTO gold.dim_brfss_jurisdiction (
+                state_code,
+                jurisdiction_name
+            )
+            SELECT
+                g.state_fips,
+                g.location_name
+            FROM gold.dim_geography g
+            WHERE g.geography_level = 'STATE'
+              AND g.country_code = 'US'
+              AND g.state_fips IN :state_codes
+            ON CONFLICT (state_code) DO NOTHING
+        """).bindparams(
+            bindparam("state_codes", expanding=True)
+        ),
+        {"state_codes": states},
+    )
 
-    if invalid_states:
-        raise ValueError(
-            f"Códigos FIPS BRFSS inválidos: {invalid_states}"
+    # Recuperar las jurisdicciones y comprobar sus nombres.
+    jurisdiction_rows = conn.execute(
+        text("""
+            SELECT
+                jurisdiction_key,
+                state_code,
+                jurisdiction_name
+            FROM gold.dim_brfss_jurisdiction
+        """)
+    ).mappings().all()
+
+    jurisdiction_map = {}
+    jurisdiction_names = {}
+
+    for row in jurisdiction_rows:
+        normalized_state_code = (
+            str(row["state_code"]).strip().zfill(2)
         )
 
-    # Crear las correspondencias utilizando FIPS normalizados.
+        if normalized_state_code in jurisdiction_map:
+            raise ValueError(
+                "La dimensión BRFSS contiene códigos estatales "
+                "duplicados al normalizar FIPS: "
+                f"{normalized_state_code}."
+            )
+
+        jurisdiction_map[normalized_state_code] = (
+            row["jurisdiction_key"]
+        )
+        jurisdiction_names[normalized_state_code] = (
+            row["jurisdiction_name"]
+        )
+
+    missing_jurisdictions = sorted(
+        set(states) - set(jurisdiction_map)
+    )
+
+    if missing_jurisdictions:
+        raise ValueError(
+            "No se encontraron jurisdicciones en Gold para los "
+            f"FIPS de Silver: {missing_jurisdictions}."
+        )
+
+    # Validar que los nombres de las jurisdicciones coincidan
+    # con los nombres del catálogo geográfico Gold.
+    geography_names = conn.execute(
+        text("""
+            SELECT state_fips, location_name
+            FROM gold.dim_geography
+            WHERE geography_level = 'STATE'
+              AND country_code = 'US'
+              AND state_fips IN :state_codes
+        """).bindparams(
+            bindparam("state_codes", expanding=True)
+        ),
+        {"state_codes": states},
+    ).mappings().all()
+
+    expected_names = {
+        str(row["state_fips"]).strip().zfill(2):
+            row["location_name"]
+        for row in geography_names
+    }
+
+    if set(expected_names) != set(states):
+        raise ValueError(
+            "El catálogo geográfico no contiene exactamente "
+            "las 52 jurisdicciones esperadas."
+        )
+
+    name_mismatches = {
+        state: {
+            "jurisdiction_name": jurisdiction_names[state],
+            "geography_name": expected_names[state],
+        }
+        for state in states
+        if jurisdiction_names[state] != expected_names[state]
+    }
+
+    if name_mismatches:
+        raise ValueError(
+            "Los nombres de las jurisdicciones BRFSS no coinciden "
+            f"con Gold.dim_geography: {name_mismatches}"
+        )
+
+
+    # --------------------------------------------------------
+    # Puente geográfico BRFSS -> Gold
+    # Correspondencia mediante FIPS estatal.
+    # --------------------------------------------------------
+
+    # Los códigos ya fueron normalizados a dos dígitos y validados arriba.
+
+    # Insertar únicamente correspondencias faltantes. Nunca sobrescribir
+    # automáticamente una relación geográfica ya existente.
     bridge_insert = text("""
         INSERT INTO gold.bridge_brfss_geography (
             jurisdiction_key,
@@ -653,15 +771,14 @@ def load_dimensions(conn, records: list[dict]):
             'STATE_FIPS'
         FROM gold.dim_brfss_jurisdiction j
         INNER JOIN gold.dim_geography g
-            ON g.state_fips = LPAD(TRIM(j.state_code), 2, '0')
-        AND g.geography_level = 'STATE'
+            ON g.state_fips = j.state_code
+           AND g.geography_level = 'STATE'
         WHERE j.state_code IN :state_codes
-        ON CONFLICT (jurisdiction_key) DO UPDATE
-        SET
-            geography_key = EXCLUDED.geography_key,
-            state_code = EXCLUDED.state_code,
-            state_fips = EXCLUDED.state_fips,
-            mapping_method = EXCLUDED.mapping_method
+          AND NOT EXISTS (
+              SELECT 1
+              FROM gold.bridge_brfss_geography existing
+              WHERE existing.jurisdiction_key = j.jurisdiction_key
+          )
     """).bindparams(
         bindparam("state_codes", expanding=True)
     )
@@ -671,23 +788,44 @@ def load_dimensions(conn, records: list[dict]):
         {"state_codes": states}
     )
 
-    # Validar cantidad y unicidad de correspondencias.
-    bridge_validation = conn.execute(text("""
-        SELECT
-            COUNT(*) AS total_mappings,
-            COUNT(DISTINCT jurisdiction_key) AS jurisdictions,
-            COUNT(DISTINCT geography_key) AS geographies
-        FROM gold.bridge_brfss_geography
-    """)).mappings().one()
+    # Validar exclusivamente las 52 jurisdicciones observadas en Silver.
+    bridge_validation = conn.execute(
+        text("""
+            SELECT
+                COUNT(*) AS total_mappings,
+                COUNT(DISTINCT j.jurisdiction_key) AS jurisdictions,
+                COUNT(DISTINCT b.geography_key) AS geographies,
+                COUNT(*) FILTER (
+                    WHERE b.jurisdiction_key IS NULL
+                       OR g.geography_key IS NULL
+                       OR b.state_code IS DISTINCT FROM j.state_code
+                       OR b.state_fips IS DISTINCT FROM g.state_fips
+                       OR b.state_fips IS DISTINCT FROM j.state_code
+                       OR b.geography_key IS DISTINCT FROM g.geography_key
+                       OR b.mapping_method IS DISTINCT FROM 'STATE_FIPS'
+                       OR g.geography_level IS DISTINCT FROM 'STATE'
+                ) AS invalid_mappings
+            FROM gold.dim_brfss_jurisdiction j
+            LEFT JOIN gold.bridge_brfss_geography b
+                ON b.jurisdiction_key = j.jurisdiction_key
+            LEFT JOIN gold.dim_geography g
+                ON g.geography_key = b.geography_key
+            WHERE j.state_code IN :state_codes
+        """).bindparams(
+            bindparam("state_codes", expanding=True)
+        ),
+        {"state_codes": states}
+    ).mappings().one()
 
     if (
         bridge_validation["total_mappings"] != 52
         or bridge_validation["jurisdictions"] != 52
         or bridge_validation["geographies"] != 52
+        or bridge_validation["invalid_mappings"] != 0
     ):
         raise ValueError(
-            "Puente geográfico BRFSS inválido: "
-            f"{dict(bridge_validation)}"
+            "Puente geográfico BRFSS inválido para las jurisdicciones "
+            f"de Silver: {dict(bridge_validation)}"
         )
 
     # Verificar jurisdicciones sin correspondencia.
@@ -827,7 +965,7 @@ def load_facts(
             payload.append({
                 "source_key": source_key,
                 "jurisdiction_key": jurisdiction_map[
-                    person["state_code"]
+                    str(person["state_code"]).strip().zfill(2)
                 ],
                 "variable_key": variable_map[variable],
                 "sequence_number": person["sequence_number"],

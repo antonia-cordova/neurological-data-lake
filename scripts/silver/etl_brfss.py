@@ -26,7 +26,7 @@ XPT_FILE = SOURCE_DIR / "LLCP2023.XPT"
 CODEBOOK_FILE = SOURCE_DIR / "USCODE23_LLCP_021924.HTML"
 
 DATASET_NAME = "brfss_2023"
-TARGET_TABLE = "silver_brfss_2023"
+TARGET_TABLE = "silver_respondent+silver_brfss_2023"
 CHUNK_SIZE = 10_000
 SAMPLE_SIZE = 2_800
 SAMPLE_SEED = "neurological-data-lake-brfss-2023-v1"
@@ -139,30 +139,53 @@ def validate_source_files() -> None:
 
 def validate_target_schema(engine: Engine) -> None:
     query = text("""
-        SELECT column_name, data_type, is_nullable, is_identity
+        SELECT column_name, data_type, character_maximum_length,
+               is_nullable, is_identity
         FROM information_schema.columns
         WHERE table_schema = 'public' AND table_name = :table_name
         ORDER BY ordinal_position
     """)
+    expected_schemas = {
+        "silver_respondent": {
+            "respondent_id": ("bigint", None, "NO", "YES"),
+            "sequence_number": ("text", None, "NO", "NO"),
+            "state_fips": ("character varying", 2, "NO", "NO"),
+            "run_id": ("bigint", None, "NO", "NO"),
+        },
+        "silver_brfss_2023": {
+            "respondent_id": ("bigint", None, "NO", "NO"),
+            "record_data": ("jsonb", None, "NO", "NO"),
+        },
+    }
     with engine.connect() as conn:
-        rows = conn.execute(query, {"table_name": TARGET_TABLE}).mappings().all()
-    expected = {
-        "respondent_id": ("bigint", "NO", "YES"),
-        "state_code": ("text", "NO", "NO"),
-        "sequence_number": ("text", "NO", "NO"),
-        "record_data": ("jsonb", "NO", "NO"),
-        "run_id": ("bigint", "NO", "NO"),
-    }
-    actual = {
-        r["column_name"]: (r["data_type"], r["is_nullable"], r["is_identity"])
-        for r in rows
-    }
-    if actual != expected:
-        raise RuntimeError(
-            f"Esquema inesperado en public.{TARGET_TABLE}. "
-            f"Ejecuta sql/silver/schema_silver.sql en una base de datos nueva..\n"
-            f"Esperado: {expected}\nActual: {actual}"
-        )
+        for table_name, expected in expected_schemas.items():
+            rows = conn.execute(query, {"table_name": table_name}).mappings().all()
+            actual = {
+                row["column_name"]: (
+                    row["data_type"], row["character_maximum_length"],
+                    row["is_nullable"], row["is_identity"],
+                )
+                for row in rows
+            }
+            if actual != expected:
+                raise RuntimeError(
+                    f"Esquema inesperado en public.{table_name}. "
+                    "Ejecuta sql/silver/schema_silver.sql en una base nueva.\n"
+                    f"Esperado: {expected}\nActual: {actual}"
+                )
+
+        constraints = conn.execute(text("""
+            SELECT
+                COUNT(*) FILTER (WHERE tc.constraint_type = 'PRIMARY KEY') AS pk_count,
+                COUNT(*) FILTER (WHERE tc.constraint_type = 'FOREIGN KEY') AS fk_count
+            FROM information_schema.table_constraints tc
+            WHERE tc.constraint_schema = 'public'
+              AND tc.table_name = 'silver_brfss_2023'
+        """)).mappings().one()
+        if constraints["pk_count"] != 1 or constraints["fk_count"] != 1:
+            raise RuntimeError(
+                "silver_brfss_2023 debe tener una PK y una FK hacia silver_respondent."
+            )
 
 
 def create_etl_run(engine: Engine) -> int:
@@ -228,6 +251,14 @@ def normalize_identifier(value: Any, column: str) -> str:
     return normalized
 
 
+def normalize_state_fips(value: Any) -> str:
+    """Normaliza BRFSS _STATE como FIPS de dos dígitos."""
+    normalized = normalize_identifier(value, "_STATE")
+    if not normalized.isdigit() or len(normalized) > 2:
+        raise ValueError(f"_STATE no es un código FIPS estatal válido: {normalized!r}")
+    return normalized.zfill(2)
+
+
 def read_chunks():
     def read_xport_with_encoding(file_path, **kwargs):
         return pyreadstat.read_xport(
@@ -278,6 +309,8 @@ def sample_source() -> tuple[pd.DataFrame, int]:
         # Normalizar _STATE con la misma función usada en la segunda pasada.
         # pyreadstat puede entregar el código como float (p. ej. 1.0);
         # comparar "1.0" con "1" dejaba todos los estratos sin coincidencias.
+        # Se conserva la normalización histórica para no alterar los hashes
+        # ni la composición determinista de la muestra existente.
         states = chunk["_STATE"].map(
             lambda value: normalize_identifier(value, "_STATE")
         )
@@ -295,7 +328,9 @@ def sample_source() -> tuple[pd.DataFrame, int]:
     for chunk, _metadata in read_chunks():
         cols = ["_STATE", "SEQNO", *BRFSS_VARIABLES]
         small = chunk[cols].copy()
-        small["_STATE"] = small["_STATE"].map(lambda v: normalize_identifier(v, "_STATE"))
+        small["_STATE"] = small["_STATE"].map(
+            lambda value: normalize_identifier(value, "_STATE")
+        )
         small["SEQNO"] = small["SEQNO"].map(lambda v: normalize_identifier(v, "SEQNO"))
         small["_sample_hash"] = [
             hashlib.sha256(
@@ -322,64 +357,155 @@ def sample_source() -> tuple[pd.DataFrame, int]:
     return sampled.drop(columns=["_sample_hash"]), source_rows
 
 
-def load_data(engine: Engine, sampled: pd.DataFrame, run_id: int, replace: bool) -> tuple[int, int]:
-    records = []
+def load_data(
+    engine: Engine, sampled: pd.DataFrame, run_id: int,
+    source_rows: int, replace: bool,
+) -> tuple[int, int]:
+    respondents = []
+    response_payload = []
+
     for row in sampled.to_dict(orient="records"):
-        state = normalize_identifier(row.pop("_STATE"), "_STATE")
-        seq = normalize_identifier(row.pop("SEQNO"), "SEQNO")
+        state_fips = normalize_state_fips(row.pop("_STATE"))
+        sequence_number = normalize_identifier(row.pop("SEQNO"), "SEQNO")
         record_data = {name: json_safe(row[name]) for name in BRFSS_VARIABLES}
-        records.append({
-            "state_code": state,
-            "sequence_number": seq,
-            "record_data": json.dumps(
-                record_data, ensure_ascii=False, allow_nan=False, separators=(",", ":")
-            ),
+
+        respondents.append({
+            "state_fips": state_fips,
+            "sequence_number": sequence_number,
             "run_id": run_id,
         })
+        response_payload.append({
+            "state_fips": state_fips,
+            "sequence_number": sequence_number,
+            "record_data": record_data,
+        })
 
-    insert_stmt = text("""
-        INSERT INTO public.silver_brfss_2023
-            (state_code, sequence_number, record_data, run_id)
+    insert_respondent = text("""
+        INSERT INTO public.silver_respondent
+            (state_fips, sequence_number, run_id)
         VALUES
-            (:state_code, :sequence_number, CAST(:record_data AS jsonb), :run_id)
+            (:state_fips, :sequence_number, :run_id)
+    """)
+
+    insert_responses = text("""
+        INSERT INTO public.silver_brfss_2023 (respondent_id, record_data)
+        SELECT respondent.respondent_id, payload.record_data
+        FROM jsonb_to_recordset(CAST(:payload AS jsonb)) AS payload(
+            state_fips TEXT,
+            sequence_number TEXT,
+            record_data JSONB
+        )
+        INNER JOIN public.silver_respondent respondent
+            ON respondent.state_fips = payload.state_fips
+           AND respondent.sequence_number = payload.sequence_number
+           AND respondent.run_id = :run_id
     """)
 
     with engine.begin() as conn:
         lock_silver_budget(conn)
-        existing = int(conn.execute(
-            text("SELECT COUNT(*) FROM public.silver_brfss_2023")
-        ).scalar_one())
-        if existing and not replace:
+
+        existing_respondents = int(conn.execute(text(
+            "SELECT COUNT(*) FROM public.silver_respondent"
+        )).scalar_one())
+        existing_responses = int(conn.execute(text(
+            "SELECT COUNT(*) FROM public.silver_brfss_2023"
+        )).scalar_one())
+
+        if (existing_respondents or existing_responses) and not replace:
             raise RuntimeError(
-                f"silver_brfss_2023 ya contiene {existing} filas. Usa --replace."
+                "Las tablas BRFSS ya contienen datos "
+                f"(respondents={existing_respondents}, responses={existing_responses}). "
+                "Usa --replace para reemplazar ambas tablas."
             )
+
         if replace:
+            # Primero la tabla dependiente; luego la entidad principal.
             conn.execute(text("DELETE FROM public.silver_brfss_2023"))
+            conn.execute(text("DELETE FROM public.silver_respondent"))
 
-        for start in range(0, len(records), INSERT_BATCH_SIZE):
-            conn.execute(insert_stmt, records[start:start + INSERT_BATCH_SIZE])
+        for start in range(0, len(respondents), INSERT_BATCH_SIZE):
+            conn.execute(
+                insert_respondent,
+                respondents[start:start + INSERT_BATCH_SIZE],
+            )
 
-        persisted = int(conn.execute(text("""
-            SELECT COUNT(*) FROM public.silver_brfss_2023 WHERE run_id = :run_id
-        """), {"run_id": run_id}).scalar_one())
-        if persisted != SAMPLE_SIZE:
-            raise RuntimeError(f"Se esperaban {SAMPLE_SIZE} filas; se persistieron {persisted}.")
+        for start in range(0, len(response_payload), INSERT_BATCH_SIZE):
+            batch = response_payload[start:start + INSERT_BATCH_SIZE]
+            conn.execute(insert_responses, {
+                "payload": json.dumps(
+                    batch, ensure_ascii=False, allow_nan=False,
+                    separators=(",", ":"),
+                ),
+                "run_id": run_id,
+            })
 
-        invalid = int(conn.execute(text("""
-            SELECT COUNT(*) FROM public.silver_brfss_2023
+        respondent_count = int(conn.execute(text("""
+            SELECT COUNT(*) FROM public.silver_respondent
             WHERE run_id = :run_id
+        """), {"run_id": run_id}).scalar_one())
+        response_count = int(conn.execute(text("""
+            SELECT COUNT(*)
+            FROM public.silver_brfss_2023 response
+            INNER JOIN public.silver_respondent respondent
+                ON respondent.respondent_id = response.respondent_id
+            WHERE respondent.run_id = :run_id
+        """), {"run_id": run_id}).scalar_one())
+
+        if respondent_count != SAMPLE_SIZE or response_count != SAMPLE_SIZE:
+            raise RuntimeError(
+                "Conteos BRFSS inconsistentes: "
+                f"respondents={respondent_count}, responses={response_count}, "
+                f"esperados={SAMPLE_SIZE}."
+            )
+        invalid = int(conn.execute(text("""
+            SELECT COUNT(*)
+            FROM public.silver_brfss_2023 response
+            INNER JOIN public.silver_respondent respondent
+                ON respondent.respondent_id = response.respondent_id
+            WHERE respondent.run_id = :run_id
               AND (
-                jsonb_typeof(record_data) <> 'object'
-                OR (SELECT COUNT(*) FROM jsonb_object_keys(record_data)) <> 20
+                  jsonb_typeof(response.record_data) <> 'object'
+                  OR (SELECT COUNT(*) FROM jsonb_object_keys(response.record_data)) <> 20
               )
         """), {"run_id": run_id}).scalar_one())
         if invalid:
-            raise RuntimeError(f"Se detectaron {invalid} registros BRFSS inválidos.")
+            raise RuntimeError(f"Se detectaron {invalid} respuestas BRFSS inválidas.")
+
+        unmatched = int(conn.execute(text("""
+            SELECT COUNT(*)
+            FROM public.silver_respondent respondent
+            LEFT JOIN public.silver_brfss_2023 response
+                ON response.respondent_id = respondent.respondent_id
+            WHERE respondent.run_id = :run_id
+              AND response.respondent_id IS NULL
+        """), {"run_id": run_id}).scalar_one())
+        if unmatched:
+            raise RuntimeError(
+                f"Se detectaron {unmatched} encuestados sin respuesta asociada."
+            )
 
         total_cells = enforce_silver_budget(conn)
-        logger.info("Presupuesto Silver validado: %s / 100000 celdas", total_cells)
+        logger.info(
+            "Presupuesto Silver validado: %s / %s celdas",
+            total_cells, 100_000,
+        )
 
-    return len(sampled), persisted
+        # El estado succeeded se confirma en la misma transacción que ambas tablas.
+        conn.execute(text("""
+            UPDATE public.etl_runs
+            SET finished_at = GREATEST(clock_timestamp(), started_at),
+                status = 'succeeded',
+                source_rows = :source_rows,
+                loaded_rows = :loaded_rows,
+                error_message = NULL
+            WHERE run_id = :run_id
+        """), {
+            "run_id": run_id,
+            "source_rows": source_rows,
+            "loaded_rows": SAMPLE_SIZE,
+        })
+
+    return len(sampled), response_count
 
 
 def main() -> int:
@@ -401,8 +527,7 @@ def main() -> int:
             source_rows, len(sampled), len(BRFSS_VARIABLES),
         )
         run_id = create_etl_run(engine)
-        loaded_rows, _ = load_data(engine, sampled, run_id, args.replace)
-        update_etl_run(engine, run_id, "succeeded", source_rows, loaded_rows)
+        loaded_rows, _ = load_data(engine, sampled, run_id, source_rows, args.replace)
         logger.info(
             "ETL BRFSS completado | run_id=%s | origen=%s | muestra=%s",
             run_id, source_rows, loaded_rows,

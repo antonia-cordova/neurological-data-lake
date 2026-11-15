@@ -1,8 +1,10 @@
 ﻿from __future__ import annotations
 from scripts.gold.db_connection import create_gold_engine
 import argparse
+from contextlib import contextmanager, nullcontext
 import logging
 import os
+import re
 from pathlib import Path
 from dotenv import load_dotenv
 from sqlalchemy import URL, create_engine, text
@@ -20,7 +22,34 @@ EXPECTED_GEOGRAPHIES = 83
 EXPECTED_MEASURES = 15
 EXPECTED_PREVALENCE_TYPES = 2
 
+# Sufijos administrativos que Gold conserva en el nombre canónico y que
+# PLACES puede omitir. La comparación elimina únicamente un sufijo final
+# de esta lista; nunca modifica ni actualiza gold.dim_geography.location_name.
+GEOGRAPHY_NAME_SUFFIXES = (
+    "County",
+    "Parish",
+    "Census Area",
+    "Planning Region",
+    "city",
+)
+
+
+def normalize_geography_name(value: str | None) -> str | None:
+    """Normaliza diferencias conocidas de sufijos administrativos finales."""
+    if value is None:
+        return None
+
+    normalized = " ".join(str(value).strip().split())
+    suffix_pattern = r"\s+(?:" + "|".join(
+        re.escape(suffix) for suffix in GEOGRAPHY_NAME_SUFFIXES
+    ) + r")$"
+    return re.sub(suffix_pattern, "", normalized, flags=re.IGNORECASE).strip().casefold()
+
+COORDINATE_TOLERANCE = 0.000001
 INSERT_BATCH_SIZE = 500
+
+# Debe coincidir con el bloqueo global de scripts/run_gold_pipeline.py.
+GOLD_PIPELINE_LOCK_KEY = 78_115_004_452_421
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,7 +68,7 @@ def resolve_source_run_id(
     conn,
     requested_run_id: int | None = None,
 ) -> int:
-    """Selecciona y valida una ejecuciÃƒÂ³n Silver de PLACES."""
+    """Selecciona y valida una ejecución Silver de PLACES."""
 
     run_id = resolve_single_silver_run_id(
         conn,
@@ -67,7 +96,8 @@ def validate_source_run(conn, source_run_id: int) -> dict:
                 target_table,
                 source_rows,
                 loaded_rows,
-                status
+                status,
+                finished_at
             FROM public.etl_runs
             WHERE run_id = :run_id
         """),
@@ -76,7 +106,7 @@ def validate_source_run(conn, source_run_id: int) -> dict:
 
     if run is None:
         raise ValueError(
-            f"No existe la ejecuciÃƒÂ³n ETL run_id={source_run_id}."
+            f"No existe la ejecución ETL run_id={source_run_id}."
         )
 
     if run["dataset_name"] != DATASET_NAME:
@@ -91,7 +121,13 @@ def validate_source_run(conn, source_run_id: int) -> dict:
 
     if run["status"] != "succeeded":
         raise ValueError(
-            f"La ejecuciÃƒÂ³n {source_run_id} no terminÃƒÂ³ correctamente."
+            f"La ejecución {source_run_id} no terminó correctamente."
+        )
+
+    if run["finished_at"] is None:
+        raise ValueError(
+            f"La ejecución {source_run_id} no tiene finished_at; "
+            "no se consumirá una ejecución Silver sin cierre confirmado."
         )
 
     return dict(run)
@@ -100,7 +136,7 @@ def validate_source_run(conn, source_run_id: int) -> dict:
 def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
     expected_run_id = source_run["run_id"]
 
-    # Evitar que otra ejecuciÃƒÂ³n ETL reemplace Silver
+    # Evitar que otra ejecución ETL reemplace Silver
     # mientras Gold valida y consume los registros.
     conn.execute(text("""
         LOCK TABLE public.silver_places_2023 IN SHARE MODE
@@ -130,10 +166,10 @@ def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
         or lineage["max_run_id"] != expected_run_id
     ):
         raise ValueError(
-            "La trazabilidad de Silver no coincide con la ejecuciÃƒÂ³n "
+            "La trazabilidad de Silver no coincide con la ejecución "
             f"solicitada. Esperado run_id={expected_run_id}; "
             f"resultado={dict(lineage)}. "
-            "No se cargarÃƒÂ¡ Gold."
+            "No se cargará Gold."
         )
 
     # LEER REGISTROS SILVER
@@ -166,7 +202,7 @@ def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
 
     if len(records) != source_run["loaded_rows"]:
         raise ValueError(
-            "El nÃƒÂºmero de filas Silver no coincide con loaded_rows "
+            "El número de filas Silver no coincide con loaded_rows "
             f"del run_id={expected_run_id}."
         )
 
@@ -185,7 +221,7 @@ def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
 
     if len(geographies) != EXPECTED_GEOGRAPHIES:
         raise ValueError(
-            f"GeografÃƒÂ­as encontradas: {len(geographies)}; "
+            f"Geografías encontradas: {len(geographies)}; "
             f"esperadas: {EXPECTED_GEOGRAPHIES}."
         )
 
@@ -212,7 +248,7 @@ def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
 
     if len(natural_keys) != len(records):
         raise ValueError(
-            "Silver contiene combinaciones geografÃƒÂ­a-indicador-tipo duplicadas."
+            "Silver contiene combinaciones geografía-indicador-tipo duplicadas."
         )
 
     for row in records:
@@ -264,7 +300,7 @@ def load_dimensions(conn, records: list[dict]) -> tuple[dict, dict, dict]:
         )
 
     # --------------------------------------------------------
-    # 2. Construir geografÃƒÂ­as de condado desde PLACES
+    # 2. Construir geografías de condado desde PLACES
     # --------------------------------------------------------
     geographies = {}
 
@@ -273,14 +309,14 @@ def load_dimensions(conn, records: list[dict]) -> tuple[dict, dict, dict]:
 
         if not raw_location_id.isdigit() or len(raw_location_id) > 5:
             raise ValueError(
-                f"FIPS de condado invÃƒÂ¡lido: {raw_location_id!r}."
+                f"FIPS de condado inválido: {raw_location_id!r}."
             )
 
         county_fips = raw_location_id.zfill(5)
         state_fips = county_fips[:2]
 
         if len(county_fips) != 5:
-            raise ValueError(f"FIPS invÃƒÂ¡lido: {county_fips}.")
+            raise ValueError(f"FIPS inválido: {county_fips}.")
 
         parent = states_by_fips.get(state_fips)
 
@@ -292,7 +328,7 @@ def load_dimensions(conn, records: list[dict]) -> tuple[dict, dict, dict]:
 
         if row["state_abbr"] != parent["state_abbr"]:
             raise ValueError(
-                f"Inconsistencia geogrÃƒÂ¡fica para {county_fips}: "
+                f"Inconsistencia geográfica para {county_fips}: "
                 f"PLACES indica {row['state_abbr']}, pero Gold "
                 f"asocia el FIPS {state_fips} a "
                 f"{parent['state_abbr']}."
@@ -315,7 +351,7 @@ def load_dimensions(conn, records: list[dict]) -> tuple[dict, dict, dict]:
 
         if previous is not None and previous != candidate:
             raise ValueError(
-                f"Datos geogrÃƒÂ¡ficos inconsistentes para {county_fips}."
+                f"Datos geográficos inconsistentes para {county_fips}."
             )
 
         geographies[county_fips] = candidate
@@ -357,7 +393,7 @@ def load_dimensions(conn, records: list[dict]) -> tuple[dict, dict, dict]:
     )
 
     # --------------------------------------------------------
-    # 4. Recuperar y validar las geografÃƒÂ­as existentes
+    # 4. Recuperar y validar las geografías existentes
     # --------------------------------------------------------
     geography_rows = conn.execute(text("""
         SELECT
@@ -385,8 +421,8 @@ def load_dimensions(conn, records: list[dict]) -> tuple[dict, dict, dict]:
 
     if len(geography_map) != len(geographies):
         raise ValueError(
-            "No se pudieron recuperar todas las geografÃƒÂ­as "
-            "de PLACES despuÃƒÂ©s de su inserciÃƒÂ³n."
+            "No se pudieron recuperar todas las geografías "
+            "de PLACES después de su inserción."
         )
 
     for location_id, candidate in geographies.items():
@@ -396,11 +432,56 @@ def load_dimensions(conn, records: list[dict]) -> tuple[dict, dict, dict]:
         )
 
         for column in candidate:
-            if existing[column] != candidate[column]:
+            existing_value = existing[column]
+            candidate_value = candidate[column]
+
+            if column == "location_name":
+                if existing_value == candidate_value:
+                    continue
+
+                if (
+                    normalize_geography_name(candidate_value)
+                    == normalize_geography_name(existing_value)
+                ):
+                    logger.info(
+                        "Nombre geográfico equivalente por sufijo administrativo | "
+                        "FIPS=%s | Silver=%s | Gold=%s",
+                        location_id,
+                        candidate_value,
+                        existing_value,
+                    )
+                    continue
+
+                raise ValueError(
+                    f"Inconsistencia en gold.dim_geography: location_name "
+                    f"para FIPS {location_id}. Silver={candidate_value!r}; "
+                    f"Gold={existing_value!r}. No se modificará la dimensión."
+                )
+
+            if column in {"latitude", "longitude"}:
+                if (
+                    existing_value is not None
+                    and candidate_value is not None
+                    and abs(float(existing_value) - float(candidate_value))
+                    <= COORDINATE_TOLERANCE
+                ):
+                    continue
+
+                if existing_value == candidate_value:
+                    continue
+
+                raise ValueError(
+                    f"Inconsistencia en gold.dim_geography: {column} "
+                    f"para FIPS {location_id}. Silver={candidate_value!r}; "
+                    f"Gold={existing_value!r}; tolerancia={COORDINATE_TOLERANCE}. "
+                    "No se modificará la dimensión existente."
+                )
+
+            if existing_value != candidate_value:
                 raise ValueError(
                     f"Inconsistencia en gold.dim_geography: "
                     f"{column} para FIPS {location_id}. "
-                    "No se modificarÃƒÂ¡ la dimensiÃƒÂ³n existente."
+                    "No se modificará la dimensión existente."
                 )
 
     # --------------------------------------------------------
@@ -414,7 +495,7 @@ def load_dimensions(conn, records: list[dict]) -> tuple[dict, dict, dict]:
 
         if measure_id in measures and measures[measure_id] != measure:
             raise ValueError(
-                f"DescripciÃƒÂ³n inconsistente para measure_id={measure_id}."
+                f"Descripción inconsistente para measure_id={measure_id}."
             )
 
         measures[measure_id] = measure
@@ -452,7 +533,7 @@ def load_dimensions(conn, records: list[dict]) -> tuple[dict, dict, dict]:
 
         if existing["measure"] != measure:
             raise ValueError(
-                f"CambiÃƒÂ³ la descripciÃƒÂ³n del indicador {measure_id}."
+                f"Cambió la descripción del indicador {measure_id}."
             )
 
     # --------------------------------------------------------
@@ -492,11 +573,6 @@ def load_facts(
     prevalence_map: dict,
 ) -> int:
 
-    # Serializa las cargas Gold que utilizan este bloqueo.
-    conn.execute(
-        text("SELECT pg_advisory_xact_lock(741, 2026)")
-    )
-
     # --------------------------------------------------------
     # 1. Validar la fuente
     # --------------------------------------------------------
@@ -512,11 +588,11 @@ def load_facts(
 
     if source is None:
         raise ValueError(
-            "No se encontrÃƒÂ³ la fuente PLACES en gold.dim_source."
+            "No se encontró la fuente PLACES en gold.dim_source."
         )
 
     # --------------------------------------------------------
-    # 2. Evitar reprocesar una ejecuciÃƒÂ³n ya cargada
+    # 2. Evitar reprocesar una ejecución ya cargada
     # --------------------------------------------------------
     existing = conn.execute(
         text("""
@@ -536,7 +612,7 @@ def load_facts(
             f"Ya existen {existing} hechos para "
             f"source_run_id={source_run_id}. "
             "No se permite duplicar ni sobrescribir "
-            "una versiÃƒÂ³n histÃƒÂ³rica."
+            "una versión histórica."
         )
 
     # --------------------------------------------------------
@@ -657,11 +733,97 @@ def load_facts(
 
     return loaded_rows
 
-def run_etl(source_run_id: int | None = None) -> None:
+def validate_orchestrator_lock(engine: Engine) -> None:
+    """Confirma que el proceso padre mantiene el bloqueo global compartido."""
+    with engine.connect() as conn:
+        held = conn.execute(
+            text("""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_locks
+                    WHERE locktype = 'advisory'
+                      AND granted
+                      AND pid <> pg_backend_pid()
+                      AND classid = (:lock_key >> 32)::oid
+                      AND objid = (:lock_key & 4294967295)::oid
+                      AND objsubid = 1
+                )
+            """),
+            {"lock_key": GOLD_PIPELINE_LOCK_KEY},
+        ).scalar_one()
+
+    if not held:
+        raise RuntimeError(
+            "Se indicó --orchestrated, pero no se detectó el bloqueo global "
+            "Gold del proceso padre. Se cancela para evitar una ejecución sin exclusión mutua."
+        )
+
+
+@contextmanager
+def acquire_places_execution_lock():
+    """Serializa PLACES independiente frente al pipeline Gold completo."""
+    engine = create_db_engine()
+    conn = None
+    acquired = False
+
+    try:
+        conn = engine.connect()
+        database = conn.execute(text("SELECT current_database()")).scalar_one()
+        if database != "health_datalake":
+            raise RuntimeError(
+                f"ETL PLACES bloqueado: base de datos no autorizada ({database})."
+            )
+
+        acquired = bool(
+            conn.execute(
+                text("SELECT pg_try_advisory_lock(:lock_key)"),
+                {"lock_key": GOLD_PIPELINE_LOCK_KEY},
+            ).scalar_one()
+        )
+        conn.commit()
+
+        if not acquired:
+            raise RuntimeError(
+                "Existe un pipeline Gold u otra ejecución PLACES en curso. "
+                "No se iniciará una ejecución concurrente."
+            )
+
+        logger.info("Bloqueo compartido de ejecución Gold adquirido por PLACES.")
+        yield
+    finally:
+        if conn is not None:
+            if acquired:
+                try:
+                    conn.execute(
+                        text("SELECT pg_advisory_unlock(:lock_key)"),
+                        {"lock_key": GOLD_PIPELINE_LOCK_KEY},
+                    )
+                    conn.commit()
+                    logger.info("Bloqueo compartido de ejecución Gold liberado.")
+                except Exception:
+                    logger.exception("No fue posible liberar el bloqueo; se invalidará la conexión.")
+                    conn.invalidate()
+            conn.close()
+        engine.dispose()
+
+
+def run_etl(
+    source_run_id: int | None = None,
+    orchestrated: bool = False,
+) -> None:
     engine = create_db_engine()
 
     try:
-        with engine.begin() as conn:
+        if orchestrated:
+            validate_orchestrator_lock(engine)
+            logger.info(
+                "Bloqueo global del orquestador verificado; PLACES no adquiere un segundo lock."
+            )
+            lock_context = nullcontext()
+        else:
+            lock_context = acquire_places_execution_lock()
+
+        with lock_context, engine.begin() as conn:
 
             source_run_id = resolve_source_run_id(
                 conn,
@@ -674,7 +836,7 @@ def run_etl(source_run_id: int | None = None) -> None:
             )
 
             logger.info(
-                "EjecuciÃƒÂ³n de origen validada | run_id=%s | dataset=%s",
+                "Ejecución de origen validada | run_id=%s | dataset=%s",
                 source_run_id,
                 source_run["dataset_name"],
             )
@@ -682,7 +844,7 @@ def run_etl(source_run_id: int | None = None) -> None:
             records = read_and_validate_silver(conn, source_run)
 
             logger.info(
-                "Silver validado | filas=%s | geografÃƒÂ­as=%s | indicadores=%s",
+                "Silver validado | filas=%s | geografías=%s | indicadores=%s",
                 len(records),
                 EXPECTED_GEOGRAPHIES,
                 EXPECTED_MEASURES,
@@ -709,7 +871,7 @@ def run_etl(source_run_id: int | None = None) -> None:
             )
 
     except Exception:
-        logger.exception("FallÃƒÂ³ el ETL Gold PLACES.")
+        logger.exception("Falló el ETL Gold PLACES.")
         raise
 
     finally:
@@ -718,7 +880,7 @@ def run_etl(source_run_id: int | None = None) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Carga histÃƒÂ³rica de PLACES desde Silver hacia Gold."
+        description="Carga histórica de PLACES desde Silver hacia Gold."
     )
 
     parser.add_argument(
@@ -727,14 +889,20 @@ def main() -> int:
     default=None,
     help=(
         "run_id de Silver. Si se omite, "
-        "se selecciona automÃƒÂ¡ticamente la versiÃƒÂ³n vigente."
+        "se selecciona automáticamente la versión vigente."
     ),
 )
+
+    parser.add_argument(
+        "--orchestrated",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
 
     args = parser.parse_args()
 
     try:
-        run_etl(args.source_run_id)
+        run_etl(args.source_run_id, orchestrated=args.orchestrated)
         return 0
 
     except Exception:

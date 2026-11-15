@@ -27,7 +27,8 @@ class ETLJob:
     rebuild_args: tuple[str, ...]
 
 
-# Orden de ejecución determinado por las dependencias entre tablas.
+# Orden de ejecución: ACS/BRFSS/PLACES, ACS County y finalmente Geography.
+# Geography depende de los catálogos territoriales de ACS County y PLACES.
 JOBS = {
     "acs": ETLJob(
         name="ACS nacional",
@@ -48,6 +49,16 @@ JOBS = {
         name="ACS County",
         module="scripts.silver.etl_acs_county",
         rebuild_args=("--replace-existing",),
+    ),
+    "catalogs": ETLJob(
+        name="Catálogos de fuentes e indicadores",
+        module="scripts.silver.etl_health_catalog",
+        rebuild_args=(),
+    ),
+    "geography": ETLJob(
+        name="Geography",
+        module="scripts.silver.etl_geography",
+        rebuild_args=(),
     ),
 }
 
@@ -261,9 +272,16 @@ def main() -> int:
     )
 
     if successful and all_completed:
-        logger.info(
-            "PIPELINE SILVER COMPLETADO CORRECTAMENTE."
-        )
+        if args.only:
+            logger.info(
+                "ETL SILVER INDIVIDUAL COMPLETADO: %s.",
+                JOBS[args.only].name,
+            )
+        else:
+            logger.info(
+                "PIPELINE SILVER COMPLETADO CORRECTAMENTE: "
+                "las seis etapas finalizaron sin errores."
+            )
         return 0
 
     logger.error(

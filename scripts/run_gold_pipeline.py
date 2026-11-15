@@ -4,15 +4,32 @@ import argparse
 import logging
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 from sqlalchemy import text
 
-from gold.db_connection import create_gold_engine
+from scripts.gold.db_connection import create_gold_engine
 
 ROOT = Path(__file__).resolve().parents[1]
 
 DATABASE_ALLOWED = "health_datalake"
+
+# Bloqueo de sesión PostgreSQL compartido por todas las instancias del orquestador.
+# El bloqueo permanece adquirido mientras se ejecutan también los ETL hijos.
+GOLD_PIPELINE_LOCK_KEY = 78_115_004_452_421
+
+GEOGRAPHY_DATASET = "geography_catalog"
+GEOGRAPHY_TARGET = "silver_geography+silver_county"
+
+GEOGRAPHY_EXPECTED = {
+    "silver_states": 49,
+    "silver_counties": 83,
+    "silver_county_catalog": 83,
+    "gold_states": 52,
+    "gold_counties": 83,
+    "geography_loaded_rows": 215,
+}
 
 SOURCE_CONFIG = {
     "PLACES": {
@@ -23,7 +40,7 @@ SOURCE_CONFIG = {
     },
     "BRFSS": {
         "dataset": "brfss_2023",
-        "table": "silver_brfss_2023",
+        "table": "silver_respondent+silver_brfss_2023",
         "expected_rows": 2800,
         "module": "scripts.gold.etl_gold_brfss",
     },
@@ -55,7 +72,7 @@ EXPECTED_GOLD = {
     "ACS County": {
         "facts": 332,
     },
-    "IntegraciÃ³n PLACES": {
+    "Integración PLACES": {
         "facts": 2490,
     },
 }
@@ -92,8 +109,8 @@ def inspect_gold_stage(
     run_id: int,
 ) -> bool:
     """
-    Devuelve True si la etapa estÃ¡ completa y validada.
-    Devuelve False si estÃ¡ vacÃ­a.
+    Devuelve True si la etapa está completa y validada.
+    Devuelve False si está vacía.
     Detiene el pipeline si encuentra una carga parcial o inconsistente.
     """
 
@@ -382,7 +399,7 @@ def inspect_gold_stage(
 
         expected = EXPECTED_GOLD[name]["facts"]
 
-    elif name == "IntegraciÃ³n PLACES":
+    elif name == "Integración PLACES":
         source_key = get_source_key(
             conn, "PLACES", "places_2025"
         )
@@ -449,7 +466,7 @@ def inspect_gold_stage(
         if count == 0 and invalid == 0:
             return False
                 # ------------------------------------------------------------
-        # VALIDACIÃ“N DE EQUIVALENCIA BIDIRECCIONAL PLACES - INTEGRACIÃ“N
+        # VALIDACIÓN DE EQUIVALENCIA BIDIRECCIONAL PLACES - INTEGRACIÓN
         # Comprueba que ambas tablas contengan exactamente los mismos
         # registros para el run_id y source_key seleccionados.
         # ------------------------------------------------------------
@@ -541,7 +558,7 @@ def inspect_gold_stage(
         raise RuntimeError(
             f"{name}: carga Gold parcial o inconsistente. "
             f"hechos={count}/{expected}, "
-            f"duplicados={duplicates}, invÃ¡lidos={invalid}."
+            f"duplicados={duplicates}, inválidos={invalid}."
         )
 
     return True
@@ -556,7 +573,7 @@ logger = logging.getLogger("run_gold_pipeline")
 
 
 def select_latest_silver_run(conn, name: str, config: dict) -> int:
-    """Selecciona la Ãºltima ejecuciÃ³n Silver exitosa y valida su registro."""
+    """Selecciona la última ejecución Silver exitosa y valida su registro."""
 
     run = conn.execute(
         text("""
@@ -577,7 +594,7 @@ def select_latest_silver_run(conn, name: str, config: dict) -> int:
 
     if run is None:
         raise RuntimeError(
-            f"No existe una ejecuciÃ³n Silver exitosa para {name}."
+            f"No existe una ejecución Silver exitosa para {name}."
         )
 
     run_id = int(run["run_id"])
@@ -599,8 +616,59 @@ def select_latest_silver_run(conn, name: str, config: dict) -> int:
     return run_id
 
 
+def select_latest_geography_run() -> int:
+    """Obtiene la ejecución Silver geográfica válida de esta reconstrucción."""
+    engine = create_gold_engine()
+    try:
+        with engine.connect() as conn:
+            database = conn.execute(
+                text("SELECT current_database()")
+            ).scalar_one()
+            if database != DATABASE_ALLOWED:
+                raise RuntimeError(
+                    f"Pipeline geográfico bloqueado: base detectada {database}."
+                )
+            run = conn.execute(
+                text("""
+                    SELECT run_id, loaded_rows
+                    FROM public.etl_runs
+                    WHERE dataset_name = :dataset_name
+                      AND target_table = :target_table
+                      AND status = 'succeeded'
+                      AND finished_at IS NOT NULL
+                    ORDER BY finished_at DESC, run_id DESC
+                    LIMIT 1
+                """),
+                {
+                    "dataset_name": GEOGRAPHY_DATASET,
+                    "target_table": GEOGRAPHY_TARGET,
+                },
+            ).mappings().one_or_none()
+            if run is None:
+                raise RuntimeError(
+                    "No existe una ejecución Silver exitosa para "
+                    "el catálogo geográfico."
+                )
+            run_id = int(run["run_id"])
+            loaded_rows = int(run["loaded_rows"])
+            if loaded_rows != GEOGRAPHY_EXPECTED["geography_loaded_rows"]:
+                raise RuntimeError(
+                    "La ejecución Silver geográfica no cumple el volumen "
+                    f"esperado: run_id={run_id}, loaded_rows={loaded_rows}, "
+                    f"esperado={GEOGRAPHY_EXPECTED['geography_loaded_rows']}."
+                )
+            logger.info(
+                "Ejecución Silver geográfica seleccionada | run_id=%s | filas=%s",
+                run_id,
+                loaded_rows,
+            )
+            return run_id
+    finally:
+        engine.dispose()
+
+
 def select_source_runs() -> dict[str, int]:
-    """Selecciona una Ãºnica versiÃ³n Silver para cada fuente."""
+    """Selecciona una única versión Silver para cada fuente."""
 
     engine = create_gold_engine()
 
@@ -635,7 +703,7 @@ def execute_stage(
     module: str,
     arguments: list[str],
 ) -> None:
-    """Ejecuta una etapa como mÃ³dulo Python."""
+    """Ejecuta una etapa como módulo Python."""
 
     command = [
         sys.executable,
@@ -645,7 +713,7 @@ def execute_stage(
     ]
 
     logger.info("Iniciando etapa: %s", name)
-    logger.info("MÃ³dulo: %s", module)
+    logger.info("Módulo: %s", module)
 
     result = subprocess.run(
         command,
@@ -655,11 +723,47 @@ def execute_stage(
 
     if result.returncode != 0:
         raise RuntimeError(
-            f"Pipeline detenido: etapa '{name}' terminÃ³ "
-            f"con cÃ³digo {result.returncode}."
+            f"Pipeline detenido: etapa '{name}' terminó "
+            f"con código {result.returncode}."
         )
 
     logger.info("Etapa completada: %s", name)
+
+
+def ensure_integrated_mappings() -> None:
+    """Registra y valida los 15 mapeos PLACES y 11 BRFSS del esquema Gold."""
+    engine = create_gold_engine()
+    try:
+        with engine.begin() as conn:
+            database = conn.execute(
+                text("SELECT current_database()")
+            ).scalar_one()
+            if database != DATABASE_ALLOWED:
+                raise RuntimeError(
+                    f"Registro de mapeos bloqueado: base detectada {database}."
+                )
+
+            result = conn.execute(
+                text(
+                    "SELECT places_mappings, brfss_mappings "
+                    "FROM gold.ensure_integrated_indicator_source_bridge()"
+                )
+            ).mappings().one()
+
+            places_count = int(result["places_mappings"])
+            brfss_count = int(result["brfss_mappings"])
+            if (places_count, brfss_count) != (15, 11):
+                raise RuntimeError(
+                    "Cantidades inesperadas de mapeos: "
+                    f"PLACES={places_count}/15, BRFSS={brfss_count}/11."
+                )
+            logger.info(
+                "Bridge integrado validado | PLACES=%s | BRFSS=%s",
+                places_count,
+                brfss_count,
+            )
+    finally:
+        engine.dispose()
 
 
 def stage_is_complete(name: str, run_id: int) -> bool:
@@ -690,26 +794,26 @@ def run_stage_with_resume(
     run_id: int,
     arguments: list[str],
 ) -> None:
-    """Omite una etapa completa o ejecuta una etapa vacÃ­a."""
+    """Omite una etapa completa o ejecuta una etapa vacía."""
 
     logger.info("=" * 65)
     logger.info("Evaluando etapa: %s | Silver run_id=%s", name, run_id)
 
     if stage_is_complete(name, run_id):
         logger.info(
-            "Etapa omitida: %s ya estÃ¡ completa y validada.",
+            "Etapa omitida: %s ya está completa y validada.",
             name,
         )
         return
 
-    logger.info("Etapa pendiente: %s. Se iniciarÃ¡ su ejecuciÃ³n.", name)
+    logger.info("Etapa pendiente: %s. Se iniciará su ejecución.", name)
 
     execute_stage(name, module, arguments)
 
     # No se considera completada hasta validar los resultados persistidos.
     if not stage_is_complete(name, run_id):
         raise RuntimeError(
-            f"La etapa {name} terminÃ³ sin producir los registros esperados."
+            f"La etapa {name} terminó sin producir los registros esperados."
         )
 
     logger.info("Etapa validada correctamente: %s", name)
@@ -719,7 +823,7 @@ def rebuild_gold_for_runs(runs: dict[str, int]) -> None:
     """
     Elimina los resultados Gold de las versiones Silver seleccionadas.
 
-    Preserva cat?logos, dimensiones compartidas y versiones hist?ricas
+    Preserva catálogos, dimensiones compartidas y versiones históricas
     correspondientes a otros source_run_id.
     """
     engine = create_gold_engine()
@@ -769,7 +873,7 @@ def rebuild_gold_for_runs(runs: dict[str, int]) -> None:
 
         logger.info(
             "Limpieza Gold confirmada. "
-            "Los cat?logos y otras versiones hist?ricas se preservaron."
+            "Los catálogos y otras versiones históricas se preservaron."
         )
 
     finally:
@@ -777,66 +881,400 @@ def rebuild_gold_for_runs(runs: dict[str, int]) -> None:
 
 
 
-def run_pipeline(rebuild: bool = False) -> None:
-    """Ejecuta o reanuda Gold con versiones Silver seleccionadas una sola vez."""
+@contextmanager
+def acquire_global_pipeline_lock():
+    """Mantiene un advisory lock PostgreSQL durante todo el pipeline."""
+    engine = create_gold_engine()
+    conn = None
+    acquired = False
 
-    runs = select_source_runs()
+    try:
+        conn = engine.connect()
+        database = conn.execute(
+            text("SELECT current_database()")
+        ).scalar_one()
 
-    logger.info("Versiones Silver seleccionadas: %s", runs)
+        if database != DATABASE_ALLOWED:
+            raise RuntimeError(
+                f"Pipeline bloqueado: base detectada {database}."
+            )
 
-    if rebuild:
-        rebuild_gold_for_runs(runs)
+        acquired = bool(
+            conn.execute(
+                text("SELECT pg_try_advisory_lock(:lock_key)"),
+                {"lock_key": GOLD_PIPELINE_LOCK_KEY},
+            ).scalar_one()
+        )
+        conn.commit()
 
-    for name, config in SOURCE_CONFIG.items():
-        run_stage_with_resume(
-            name=name,
-            module=config["module"],
-            run_id=runs[name],
-            arguments=[
-                "--source-run-id",
-                str(runs[name]),
-            ],
+        if not acquired:
+            raise RuntimeError(
+                "Ya existe otra instancia del pipeline Gold en ejecución. "
+                "No se iniciará una ejecución concurrente."
+            )
+
+        logger.info("Bloqueo global Gold adquirido.")
+        yield
+
+    finally:
+        if conn is not None:
+            if acquired:
+                try:
+                    conn.execute(
+                        text("SELECT pg_advisory_unlock(:lock_key)"),
+                        {"lock_key": GOLD_PIPELINE_LOCK_KEY},
+                    )
+                    conn.commit()
+                    logger.info("Bloqueo global Gold liberado.")
+                except Exception:
+                    logger.exception(
+                        "No fue posible liberar explícitamente el bloqueo Gold; "
+                        "se invalidará la conexión para liberar el lock de sesión."
+                    )
+                    conn.invalidate()
+            conn.close()
+        engine.dispose()
+
+
+def validate_geography_preflight() -> int:
+    """Valida Silver/Gold Geography sin insertar, actualizar ni borrar datos."""
+    engine = create_gold_engine()
+
+    try:
+        with engine.connect() as conn:
+            database = conn.execute(
+                text("SELECT current_database()")
+            ).scalar_one()
+            if database != DATABASE_ALLOWED:
+                raise RuntimeError(
+                    f"Preflight geográfico bloqueado: base detectada {database}."
+                )
+
+            run = conn.execute(
+                text("""
+                    SELECT run_id, loaded_rows
+                    FROM public.etl_runs
+                    WHERE dataset_name = :dataset_name
+                      AND target_table = :target_table
+                      AND status = 'succeeded'
+                      AND finished_at IS NOT NULL
+                    ORDER BY finished_at DESC, run_id DESC
+                    LIMIT 1
+                """),
+                {
+                    "dataset_name": GEOGRAPHY_DATASET,
+                    "target_table": GEOGRAPHY_TARGET,
+                },
+            ).mappings().one_or_none()
+
+            if run is None:
+                raise RuntimeError(
+                    "No existe una ejecución Silver exitosa para geography_catalog."
+                )
+
+            geography_run_id = int(run["run_id"])
+            loaded_rows = int(run["loaded_rows"])
+            if loaded_rows != GEOGRAPHY_EXPECTED["geography_loaded_rows"]:
+                raise RuntimeError(
+                    "La ejecución Silver de geografía no coincide con el "
+                    f"resultado validado: run_id={geography_run_id}, "
+                    f"loaded_rows={loaded_rows}, esperado="
+                    f"{GEOGRAPHY_EXPECTED['geography_loaded_rows']}."
+                )
+
+            counts = conn.execute(
+                text("""
+                    SELECT
+                        (SELECT COUNT(*) FROM public.silver_geography
+                         WHERE geography_level = 'STATE') AS silver_states,
+                        (SELECT COUNT(*) FROM public.silver_geography
+                         WHERE geography_level = 'COUNTY') AS silver_counties,
+                        (SELECT COUNT(*) FROM public.silver_county) AS silver_county_catalog,
+                        (SELECT COUNT(*) FROM gold.dim_geography
+                         WHERE geography_level = 'STATE') AS gold_states,
+                        (SELECT COUNT(*) FROM gold.dim_geography
+                         WHERE geography_level = 'COUNTY') AS gold_counties
+                """)
+            ).mappings().one()
+
+            actual = {key: int(value) for key, value in counts.items()}
+            expected_keys = (
+                "silver_states", "silver_counties", "silver_county_catalog",
+                "gold_states", "gold_counties",
+            )
+            mismatched_counts = {
+                key: {"actual": actual[key], "expected": GEOGRAPHY_EXPECTED[key]}
+                for key in expected_keys
+                if actual[key] != GEOGRAPHY_EXPECTED[key]
+            }
+            if mismatched_counts:
+                raise RuntimeError(
+                    f"Conteos geográficos inconsistentes: {mismatched_counts}"
+                )
+
+            silver_state_mismatches = count_rows(
+                conn,
+                """
+                SELECT COUNT(*)
+                FROM public.silver_geography sg
+                LEFT JOIN gold.dim_geography gg
+                  ON gg.geography_level = 'STATE'
+                 AND gg.location_id = sg.geography_code
+                WHERE sg.geography_level = 'STATE'
+                  AND (
+                    gg.geography_key IS NULL
+                    OR gg.state_fips IS DISTINCT FROM sg.geography_code
+                    OR gg.location_name IS DISTINCT FROM sg.geography_name
+                    OR gg.country_code IS DISTINCT FROM 'US'
+                    OR gg.parent_geography_key IS NOT NULL
+                  )
+                """,
+                {},
+            )
+
+            county_mismatches = count_rows(
+                conn,
+                """
+                SELECT COUNT(*)
+                FROM public.silver_geography sg
+                LEFT JOIN public.silver_county sc
+                    ON sc.geography_id = sg.geography_id
+                LEFT JOIN public.silver_geography sparent
+                  ON sparent.geography_id = sg.parent_geography_id
+                LEFT JOIN gold.dim_geography gg
+                  ON gg.geography_level = 'COUNTY'
+                 AND gg.location_id = sg.geography_code
+                LEFT JOIN gold.dim_geography gparent
+                  ON gparent.geography_key = gg.parent_geography_key
+                WHERE sg.geography_level = 'COUNTY'
+                  AND (
+                    sparent.geography_id IS NULL
+                    OR gg.geography_key IS NULL
+                    OR sc.geography_id IS NULL
+                    OR gg.state_fips IS DISTINCT FROM sc.state_fips
+                    OR gg.county_fips IS DISTINCT FROM sc.county_fips
+                    OR gg.state_abbr IS DISTINCT FROM sc.state_abbr
+                    OR gg.location_name IS DISTINCT FROM sg.geography_name
+                    OR gg.country_code IS DISTINCT FROM 'US'
+                    OR gparent.geography_key IS NULL
+                    OR gparent.geography_level <> 'STATE'
+                    OR gparent.location_id IS DISTINCT FROM sparent.geography_code
+                    OR sg.geography_code IS DISTINCT FROM
+                    (sc.state_fips || sc.county_fips)
+                    OR sc.state_fips IS DISTINCT FROM
+                    sparent.geography_code
+                    OR gg.location_id IS DISTINCT FROM
+                    sg.geography_code
+                  )
+                """,
+                {},
+            )
+
+            extra_jurisdictions = count_rows(
+                conn,
+                """
+                WITH expected AS (
+                    SELECT *
+                    FROM (VALUES
+                        ('66', 'Guam'),
+                        ('72', 'Puerto Rico'),
+                        ('78', 'U.S. Virgin Islands')
+                    ) AS v(state_fips, location_name)
+                )
+                SELECT COUNT(*)
+                FROM expected e
+                LEFT JOIN gold.dim_geography g
+                ON g.geography_level = 'STATE'
+                AND g.state_fips = e.state_fips
+                WHERE g.geography_key IS NULL
+                OR g.location_id IS DISTINCT FROM e.state_fips
+                OR g.location_name IS DISTINCT FROM e.location_name
+                OR g.country_code IS DISTINCT FROM 'US'
+                """,
+                {},
+            )
+
+            if extra_jurisdictions != 0:
+                raise RuntimeError(
+                    "El catálogo Gold no contiene correctamente "
+                    "las tres jurisdicciones adicionales."
+                )
+
+            silver_county_orphans = count_rows(
+                conn,
+                """
+                SELECT COUNT(*)
+                FROM public.silver_county sc
+                LEFT JOIN public.silver_geography sg
+                  ON sg.geography_id = sc.geography_id
+                 AND sg.geography_level = 'COUNTY'
+                WHERE sg.geography_id IS NULL
+                """,
+                {},
+            )
+
+            if any((silver_state_mismatches, county_mismatches, silver_county_orphans)):
+                raise RuntimeError(
+                    "La geografía Gold no coincide con el catálogo Silver: "
+                    f"estados_inconsistentes={silver_state_mismatches}, "
+                    f"condados_inconsistentes={county_mismatches}, "
+                    f"registros_silver_county_sin_geografia={silver_county_orphans}."
+                )
+
+            logger.info(
+                "Preflight geográfico aprobado | geography_run_id=%s | "
+                "Silver: 49 estados/83 condados | Gold: 52 jurisdicciones/83 condados | "
+                "sin diferencias.",
+                geography_run_id,
+            )
+            return geography_run_id
+
+    finally:
+        engine.dispose()
+
+
+def run_preflight_only() -> None:
+    """Ejecuta únicamente validaciones de solo lectura; nunca inicia ETL."""
+    with acquire_global_pipeline_lock():
+        geography_run_id = validate_geography_preflight()
+        logger.info(
+            "Preflight geográfico aprobado | geography_run_id=%s",
+            geography_run_id,
         )
 
-    run_stage_with_resume(
-        name="IntegraciÃ³n PLACES",
-        module="scripts.gold.etl_gold_integrated",
-        run_id=runs["PLACES"],
-        arguments=[
-            "--places-run-id",
-            str(runs["PLACES"]),
-        ],
-    )
+        runs = select_source_runs()
+        logger.info("Ejecuciones Silver seleccionadas: %s", runs)
 
-    logger.info(
-        "Pipeline Gold completado y todas las etapas validadas."
-    )
+        for name, run_id in runs.items():
+            is_complete = stage_is_complete(name, run_id)
+            logger.info(
+                "Estado Gold | etapa=%s | silver_run_id=%s | %s",
+                name,
+                run_id,
+                "completa y validada" if is_complete else "pendiente",
+            )
+
+        integrated_complete = stage_is_complete(
+            "Integración PLACES", runs["PLACES"]
+        )
+        logger.info(
+            "Estado Gold | etapa=Integración PLACES | silver_run_id=%s | %s",
+            runs["PLACES"],
+            "completa y validada" if integrated_complete else "pendiente",
+        )
+        logger.info(
+            "Preflight-only finalizado. No se ejecutaron ETL ni operaciones DML."
+        )
+
+
+def run_pipeline(rebuild: bool = False) -> None:
+    """Ejecuta Gold en orden controlado, bajo bloqueo global y con preflight."""
+    with acquire_global_pipeline_lock():
+        # Gold necesita primero los 83 condados procedentes de Silver.
+        # El run_id se obtiene de etl_runs; nunca queda fijado en el código.
+        geography_run_id = select_latest_geography_run()
+        execute_stage(
+            name="Geografía",
+            module="scripts.gold.etl_gold_geography",
+            arguments=["--source-run-id", str(geography_run_id)],
+        )
+
+        validated_geography_run_id = validate_geography_preflight()
+        if validated_geography_run_id != geography_run_id:
+            raise RuntimeError(
+                "El preflight validó una ejecución geográfica distinta de la "
+                "seleccionada para la carga: "
+                f"seleccionada={geography_run_id}, "
+                f"validada={validated_geography_run_id}."
+            )
+        logger.info(
+            "Dependencia geográfica cargada y validada; "
+            "Silver geography run_id=%s.",
+            validated_geography_run_id,
+        )
+
+        runs = select_source_runs()
+        logger.info("Versiones Silver seleccionadas: %s", runs)
+
+        # El preflight se realiza antes de cualquier operación destructiva.
+        if rebuild:
+            rebuild_gold_for_runs(runs)
+
+        execution_order = (
+            "PLACES",
+            "BRFSS",
+            "ACS nacional",
+            "ACS County",
+        )
+
+        for name in execution_order:
+            config = SOURCE_CONFIG[name]
+            run_stage_with_resume(
+                name=name,
+                module=config["module"],
+                run_id=runs[name],
+                arguments=[
+                    "--source-run-id",
+                    str(runs[name]),
+                    "--orchestrated",
+                ] if name in ("PLACES", "ACS nacional") else [
+                    "--source-run-id",
+                    str(runs[name]),
+                ],
+            )
+
+        # Registrar mapeos una vez cargadas las dimensiones fuente.
+        ensure_integrated_mappings()
+
+        run_stage_with_resume(
+            name="Integración PLACES",
+            module="scripts.gold.etl_gold_integrated",
+            run_id=runs["PLACES"],
+            arguments=["--places-run-id", str(runs["PLACES"])],
+        )
+
+        logger.info(
+            "Pipeline Gold completado. Geografía validada y todas las etapas verificadas."
+        )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Ejecuta los ETL Gold con versiones Silver "
-            "seleccionadas de forma centralizada."
+            "Ejecuta los ETL Gold en orden controlado, con preflight geográfico "
+            "y bloqueo global de concurrencia."
         )
+    )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help=(
+            "Ejecuta validaciones geográficas, selecciona ejecuciones Silver "
+            "e inspecciona Gold sin ejecutar ETL ni modificar datos."
+        ),
     )
     parser.add_argument(
         "--rebuild",
         action="store_true",
         help=(
-            "Reconstruye las versiones Gold seleccionadas, "
-            "preservando cat?logos y otras versiones hist?ricas."
+            "Reconstruye selectivamente las versiones Gold seleccionadas. "
+            "Valida primero la geografía y preserva catálogos y versiones históricas."
         ),
     )
 
     args = parser.parse_args()
 
-    try:
-        run_pipeline(rebuild=args.rebuild)
-        return 0
+    if args.preflight_only and args.rebuild:
+        parser.error("--preflight-only y --rebuild son opciones incompatibles.")
 
+    try:
+        if args.preflight_only:
+            run_preflight_only()
+        else:
+            run_pipeline(rebuild=args.rebuild)
+        return 0
     except Exception:
-        logger.exception("FallÃ³ el pipeline Gold.")
+        logger.exception("Falló el pipeline Gold.")
         return 1
 
 

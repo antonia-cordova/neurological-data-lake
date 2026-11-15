@@ -5,10 +5,17 @@ from sqlalchemy.engine import Connection
 MAX_SILVER_CELLS = 100_000
 ADVISORY_LOCK_KEY = 741_2026
 EXPECTED_SILVER_TABLES = {
+    # Tablas analíticas contabilizadas o vinculadas al presupuesto.
     "silver_places_2023",
     "silver_brfss_2023",
+    "silver_respondent",
     "silver_acs_2024",
     "silver_acs_county_2024",
+    # Dimensiones de referencia: se validan, pero no suman celdas analíticas.
+    "silver_geography",
+    "silver_county",
+    "silver_source",
+    "silver_health_indicator",
 }
 
 class SilverBudgetExceeded(RuntimeError):
@@ -33,10 +40,12 @@ def calculate_silver_cells(conn: Connection) -> int:
         raise RuntimeError("Faltan tablas Silver requeridas: " + ", ".join(sorted(missing)))
 
     places = int(conn.execute(text("SELECT COUNT(*) * 9 FROM public.silver_places_2023")).scalar_one())
+    # BRFSS contabiliza exclusivamente las variables analíticas del JSONB.
+    # silver_respondent contiene metadatos técnicos y no suma celdas al presupuesto.
     brfss = int(conn.execute(text("""
-        SELECT (SELECT COUNT(*) * 4 FROM public.silver_brfss_2023)
-             + (SELECT COUNT(*) FROM public.silver_brfss_2023 b
-                CROSS JOIN LATERAL jsonb_object_keys(b.record_data) AS k(key))
+        SELECT COUNT(*)
+        FROM public.silver_brfss_2023 response
+        CROSS JOIN LATERAL jsonb_object_keys(response.record_data) AS variable(key)
     """)).scalar_one())
     acs_national = int(conn.execute(text("SELECT COUNT(*) * 7 FROM public.silver_acs_2024")).scalar_one())
     # Diez campos lógicos por fila; se excluye la PK identity.
