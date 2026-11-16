@@ -8,16 +8,33 @@ import re
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
 from dotenv import load_dotenv
+import pandas as pd
 from sqlalchemy import URL, create_engine, text
 from sqlalchemy.engine import Engine
 
+from scripts.bronze.parquet_io import (
+    dataset_path,
+    read_parquet_frame,
+    selected_frequency,
+    validate_dataset_manifest,
+)
+
+from scripts.database_config import get_target_database
+
 ROOT = Path(__file__).resolve().parents[2]
-ACS_DIR = ROOT / "data" / "bronze" / "acs_2024"
-BRFSS_DIR = ROOT / "data" / "bronze" / "brfss_2023"
-PLACES_DIR = ROOT / "data" / "bronze" / "places_2025"
+LANDING_ACS_DIR = ROOT / "data" / "landing" / "acs_2024"
+LEGACY_ACS_DIR = ROOT / "data" / "bronze" / "acs_2024"
+ACS_DIR = (
+    LANDING_ACS_DIR
+    if (LANDING_ACS_DIR / "DP05.json").is_file()
+    else LEGACY_ACS_DIR
+)
+BRFSS_DIR = ROOT / "data" / "landing" / "brfss_2023"
+LANDING_PLACES_DIR = ROOT / "data" / "landing" / "places_2025"
+LEGACY_PLACES_DIR = ROOT / "data" / "bronze" / "places_2025"
 ACS_METADATA_FILE = ACS_DIR / "DP05.json"
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,7 +92,12 @@ BRFSS_META = {
     "GENHLTH": ("General health status", "health", "category", "ordinal"),
     "PHYSHLTH": ("Physical health: number of days not good", "health", "days", "count"),
     "MENTHLTH": ("Mental health: number of days not good", "health", "days", "count"),
-    "POORHLTH": ("Activity limitation due to poor physical or mental health", "health", "days", "count"),
+    "POORHLTH": (
+        "Activity limitation due to poor physical or mental health",
+        "health",
+        "days",
+        "count",
+    ),
     "DIABETE4": ("Ever diagnosed with diabetes", "health", "category", "nominal"),
     "CVDCRHD4": ("Ever diagnosed with coronary heart disease", "health", "category", "nominal"),
     "CVDSTRK3": ("Ever diagnosed with stroke", "health", "category", "nominal"),
@@ -120,9 +142,10 @@ PLACES_CATEGORY = {
 def db_engine() -> Engine:
     load_dotenv(ROOT / ".env", override=False)
 
-    if os.getenv("POSTGRES_DB") != "health_datalake":
+    target_database = get_target_database()
+    if os.getenv("POSTGRES_DB") != target_database:
         raise RuntimeError(
-            "Conexión rechazada: POSTGRES_DB debe ser health_datalake."
+            f"Conexión rechazada: POSTGRES_DB debe ser {target_database}."
         )
 
     if os.getenv("POSTGRES_HOST") != "localhost":
@@ -149,7 +172,7 @@ def db_engine() -> Engine:
         password=os.getenv("POSTGRES_PASSWORD"),
         host="localhost",
         port=5432,
-        database="health_datalake",
+        database=target_database,
     )
 
     engine = create_engine(url, pool_pre_ping=True)
@@ -160,7 +183,7 @@ def db_engine() -> Engine:
                 text("SELECT current_database()")
             ).scalar_one()
 
-            if actual_database != "health_datalake":
+            if actual_database != target_database:
                 raise RuntimeError(
                     f"Base de datos inesperada: {actual_database!r}"
                 )
@@ -238,12 +261,6 @@ def read_acs_national_metadata() -> list[dict[str, Any]]:
             f"No se encontró CSV DP05 en {ACS_DIR}"
         )
 
-    frame = pd.read_csv(
-        candidates[0],
-        dtype=str,
-        keep_default_na=False,
-    )
-
     required = [
         "Label (Grouping)",
         "United States!!Estimate",
@@ -251,6 +268,22 @@ def read_acs_national_metadata() -> list[dict[str, Any]]:
         "United States!!Percent",
         "United States!!Percent Margin of Error",
     ]
+
+    if selected_frequency() is not None:
+        manifest = validate_dataset_manifest("acs_2024")
+        frame = read_parquet_frame(
+            dataset_path("acs_2024"),
+            columns=required,
+        ).to_pandas()
+        frame = frame.fillna("").astype(str)
+        if len(frame) != int(manifest["source_rows"]):
+            raise ValueError("El catálogo ACS no coincide con el conteo Bronze.")
+    else:
+        frame = pd.read_csv(
+            candidates[0],
+            dtype=str,
+            keep_default_na=False,
+        )
 
     if list(frame.columns) != required or len(frame) != 113:
         raise ValueError(
@@ -440,18 +473,29 @@ def build_indicator_records() -> list[dict[str, Any]]:
             }
         )
 
-    bronze_candidates = sorted(PLACES_DIR.glob("*.csv"))
-
-    if not bronze_candidates:
-        raise FileNotFoundError(
-            f"No se encontró CSV PLACES en {PLACES_DIR}"
+    if selected_frequency() is not None:
+        manifest = validate_dataset_manifest("places_2025")
+        places = read_parquet_frame(
+            dataset_path("places_2025"),
+            columns=["Measure", "MeasureId"],
+        ).to_pandas()
+        if len(places) != int(manifest["source_rows"]):
+            raise ValueError("El catálogo PLACES no coincide con el conteo Bronze.")
+        places = places.replace("", pd.NA).astype("string")
+    else:
+        bronze_candidates = sorted(LANDING_PLACES_DIR.glob("*.csv"))
+        if not bronze_candidates:
+            bronze_candidates = sorted(LEGACY_PLACES_DIR.glob("*.csv"))
+        if len(bronze_candidates) != 1:
+            raise FileNotFoundError(
+                "Se esperaba un CSV PLACES en Landing o Bronze heredado; "
+                f"encontrados={len(bronze_candidates)}."
+            )
+        places = pd.read_csv(
+            bronze_candidates[0],
+            usecols=["Measure", "MeasureId"],
+            dtype=str,
         )
-
-    places = pd.read_csv(
-        bronze_candidates[0],
-        usecols=["Measure", "MeasureId"],
-        dtype=str,
-    )
 
     places = places.dropna(subset=["MeasureId"]).copy()
     places["MeasureId"] = places["MeasureId"].str.strip()

@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 from scripts.gold.db_connection import create_gold_engine
+from scripts.database_config import get_target_database
 import argparse
 from contextlib import contextmanager, nullcontext
 import logging
@@ -769,7 +770,7 @@ def acquire_places_execution_lock():
     try:
         conn = engine.connect()
         database = conn.execute(text("SELECT current_database()")).scalar_one()
-        if database != "health_datalake":
+        if database != get_target_database():
             raise RuntimeError(
                 f"ETL PLACES bloqueado: base de datos no autorizada ({database})."
             )

@@ -17,6 +17,8 @@ from scripts.silver.silver_budget import lock_silver_budget
 # CONFIGURATION
 # ============================================================
 
+from scripts.database_config import get_target_database
+
 ROOT = Path(__file__).resolve().parents[2]
 
 DATASET_NAME = "geography_catalog"
@@ -39,7 +41,7 @@ log = logging.getLogger("etl_geography")
 def create_db_engine() -> Engine:
     load_dotenv(ROOT / ".env", override=False)
 
-    allowed_database = "health_datalake"
+    allowed_database = get_target_database()
     allowed_host = "localhost"
     allowed_port = 5432
 

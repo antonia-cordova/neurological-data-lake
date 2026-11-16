@@ -1,19 +1,227 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import logging
 import subprocess
 import sys
+import json
 from contextlib import contextmanager
 from pathlib import Path
 
 from sqlalchemy import text
 
 from scripts.gold.db_connection import create_gold_engine
+from scripts.gold.resume import classify_geography_counts
+from scripts.database_config import get_target_database
 
 ROOT = Path(__file__).resolve().parents[1]
 
-DATABASE_ALLOWED = "health_datalake"
+DATABASE_ALLOWED = get_target_database()
+
+
+def _same_ground_truth_value(actual, expected) -> bool:
+    """Compara un valor PostgreSQL con el valor exportado en Ground Truth."""
+    from decimal import Decimal, InvalidOperation
+
+    if expected is None:
+        return actual is None
+
+    if actual is None:
+        return False
+
+    try:
+        return Decimal(str(actual)) == Decimal(str(expected))
+    except (InvalidOperation, ValueError, TypeError):
+        return str(actual) == str(expected)
+
+
+def load_integrated_quality_exceptions(conn, run_id: int) -> tuple[list[int], list[int]]:
+    """
+    Obtiene las excepciones de calidad autorizadas para fact_health_integrated.
+
+    Cada excepción debe:
+    - Pertenecer al escenario y base de datos actuales.
+    - Estar registrada en Ground Truth.
+    - Tener una clave primaria válida.
+    - Coincidir con el valor que actualmente existe en PostgreSQL.
+    - Corresponder a la ejecución Silver que se está validando.
+
+    Devuelve:
+        (semantic_exception_ids, null_exception_ids)
+    """
+    database = DATABASE_ALLOWED
+
+    if database.startswith("health_datalake_medium"):
+        level = "medium"
+    elif database.startswith("health_datalake_poor"):
+        level = "poor"
+    else:
+        raise RuntimeError(
+            "No se permiten excepciones de calidad para este escenario: "
+            f"{database}"
+        )
+
+    if not database.endswith("_test"):
+        raise RuntimeError(
+            "La validación de excepciones Ground Truth está configurada "
+            "para bases de datos de test. Base actual: " + database
+        )
+
+    ground_truth_path = (
+        ROOT
+        / "quality"
+        / "ground_truth"
+        / f"ground_truth_{level}_test.jsonl"
+    )
+
+    if not ground_truth_path.is_file():
+        raise RuntimeError(
+            f"No existe el archivo Ground Truth requerido: {ground_truth_path}"
+        )
+
+    semantic_records = {}
+    null_records = {}
+
+    with ground_truth_path.open("r", encoding="utf-8") as file:
+        for line_number, line in enumerate(file, start=1):
+            if not line.strip():
+                continue
+
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"JSONL inválido en línea {line_number}: {exc}"
+                ) from exc
+
+            if (
+                record.get("schema") != "gold"
+                or record.get("table") != "fact_health_integrated"
+            ):
+                continue
+
+            rule = record.get("rule")
+            column = record.get("column")
+            dimension = record.get("dimension")
+
+            is_semantic_exception = (
+                column == "health_measure_key"
+                and rule == "fk_valid_semantic_association_swap"
+                and dimension == "semantic_consistency"
+            )
+
+            is_null_exception = (
+                column == "value_numeric"
+                and rule == "null_injection"
+                and dimension == "completeness"
+            )
+
+            # Las modificaciones de accuracy, como numeric_percent,
+            # no son excepciones de integridad y no se incluyen aquí.
+            if not is_semantic_exception and not is_null_exception:
+                continue
+
+            if (
+                record.get("database") != database
+                or record.get("level") != level
+            ):
+                raise RuntimeError(
+                    "Registro Ground Truth con escenario o base de datos "
+                    f"inconsistente en línea {line_number}."
+                )
+
+            try:
+                primary_key = json.loads(record["primary_key"])
+                fact_id = int(primary_key["integrated_fact_key"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"Clave primaria inválida en Ground Truth, línea {line_number}."
+                ) from exc
+
+            if set(primary_key) != {"integrated_fact_key"}:
+                raise RuntimeError(
+                    f"Clave primaria inesperada en línea {line_number}."
+                )
+
+            target = semantic_records if is_semantic_exception else null_records
+
+            if fact_id in target:
+                raise RuntimeError(
+                    "Ground Truth contiene una excepción duplicada para "
+                    f"integrated_fact_key={fact_id}, línea {line_number}."
+                )
+
+            target[fact_id] = record
+
+    # Comprobar cada excepción contra el valor actualmente almacenado.
+    for fact_id, record in semantic_records.items():
+        result = conn.execute(
+            text("""
+                SELECT health_measure_key, source_run_id
+                FROM gold.fact_health_integrated
+                WHERE integrated_fact_key = :fact_id
+            """),
+            {"fact_id": fact_id},
+        ).mappings().one_or_none()
+
+        if (
+                result is None
+                or int(result["source_run_id"]) != int(run_id)
+            ):
+            raise RuntimeError(
+                "Excepción semántica Ground Truth fuera de la ejecución "
+                f"Silver actual: integrated_fact_key={fact_id}."
+            )
+
+        if not _same_ground_truth_value(
+            result["health_measure_key"],
+            record.get("altered_value"),
+        ):
+            raise RuntimeError(
+                "El valor actual no coincide con Ground Truth para "
+                f"health_measure_key, integrated_fact_key={fact_id}."
+            )
+
+    for fact_id, record in null_records.items():
+        result = conn.execute(
+            text("""
+                SELECT value_numeric, source_run_id
+                FROM gold.fact_health_integrated
+                WHERE integrated_fact_key = :fact_id
+            """),
+            {"fact_id": fact_id},
+        ).mappings().one_or_none()
+
+        if (
+                result is None
+                or int(result["source_run_id"]) != int(run_id)
+            ):
+            raise RuntimeError(
+                "Excepción de nulidad Ground Truth fuera de la ejecución "
+                f"Silver actual: integrated_fact_key={fact_id}."
+            )
+
+        if not _same_ground_truth_value(
+            result["value_numeric"],
+            record.get("altered_value"),
+        ):
+            raise RuntimeError(
+                "El valor actual no coincide con Ground Truth para "
+                f"value_numeric, integrated_fact_key={fact_id}."
+            )
+
+    semantic_ids = sorted(semantic_records)
+    null_ids = sorted(null_records)
+
+    logger.info(
+        "Excepciones Ground Truth verificadas | "
+        "health_measure_key=%s | value_numeric=NULL=%s",
+        len(semantic_ids),
+        len(null_ids),
+    )
+
+    return semantic_ids, null_ids
+
 
 # Bloqueo de sesión PostgreSQL compartido por todas las instancias del orquestador.
 # El bloqueo permanece adquirido mientras se ejecutan también los ETL hijos.
@@ -107,6 +315,7 @@ def inspect_gold_stage(
     conn,
     name: str,
     run_id: int,
+    allow_quality_degradation: bool = False,
 ) -> bool:
     """
     Devuelve True si la etapa está completa y validada.
@@ -148,6 +357,7 @@ def inspect_gold_stage(
             {"run_id": run_id, "source_key": source_key},
         )
 
+        
         invalid = count_rows(
             conn,
             """
@@ -160,7 +370,7 @@ def inspect_gold_stage(
             LEFT JOIN gold.dim_prevalence_type prevalence
                 ON prevalence.prevalence_type_key = fact.prevalence_type_key
             WHERE fact.source_run_id = :run_id
-            AND (
+              AND (
                     fact.source_key <> :source_key
                     OR geography.geography_key IS NULL
                     OR measure.health_measure_key IS NULL
@@ -170,30 +380,33 @@ def inspect_gold_stage(
                     OR fact.data_value > 100
                     OR fact.reference_year IS NULL
                     OR fact.reference_year <> 2023
-            )
+              )
             """,
             {"run_id": run_id, "source_key": source_key},
         )
 
+
         expected = EXPECTED_GOLD[name]["facts"]
 
+    
     elif name == "BRFSS":
         source_key = get_source_key(
-        conn, "BRFSS", "brfss_2023"
+            conn, "BRFSS", "brfss_2023"
         )
+
         count = count_rows(
-        conn,
-        """
-        SELECT COUNT(*)
-        FROM gold.fact_brfss_response
-        WHERE source_run_id = :run_id
-        AND source_key = :source_key
-        """,
-        {
-            "run_id": run_id,
-            "source_key": source_key,
-        },
-    )
+            conn,
+            """
+            SELECT COUNT(*)
+            FROM gold.fact_brfss_response
+            WHERE source_run_id = :run_id
+              AND source_key = :source_key
+            """,
+            {
+                "run_id": run_id,
+                "source_key": source_key,
+            },
+        )
 
         duplicates = count_rows(
             conn,
@@ -215,26 +428,27 @@ def inspect_gold_stage(
         )
 
         invalid = count_rows(
-        conn,
-        """
-        SELECT COUNT(*)
-        FROM gold.fact_brfss_response fact
-        LEFT JOIN gold.dim_brfss_variable variable
-            ON variable.variable_key = fact.variable_key
-        LEFT JOIN gold.dim_brfss_jurisdiction jurisdiction
-            ON jurisdiction.jurisdiction_key = fact.jurisdiction_key
-        WHERE fact.source_run_id = :run_id
-        AND (
-        fact.source_key <> :source_key
-        OR variable.variable_key IS NULL
-        OR jurisdiction.jurisdiction_key IS NULL
+            conn,
+            """
+            SELECT COUNT(*)
+            FROM gold.fact_brfss_response fact
+            LEFT JOIN gold.dim_brfss_variable variable
+                ON variable.variable_key = fact.variable_key
+            LEFT JOIN gold.dim_brfss_jurisdiction jurisdiction
+                ON jurisdiction.jurisdiction_key = fact.jurisdiction_key
+            WHERE fact.source_run_id = :run_id
+              AND (
+                    fact.source_key <> :source_key
+                    OR variable.variable_key IS NULL
+                    OR jurisdiction.jurisdiction_key IS NULL
+              )
+            """,
+            {
+                "run_id": run_id,
+                "source_key": source_key,
+            },
         )
-        """,
-        {
-            "run_id": run_id,
-            "source_key": source_key,
-        },
-    )
+
         expected = EXPECTED_GOLD[name]["facts"]
 
 
@@ -433,6 +647,15 @@ def inspect_gold_stage(
             {"run_id": run_id, "source_key": source_key},
         )
 
+        
+        semantic_exception_ids = []
+        null_exception_ids = []
+
+        if allow_quality_degradation:
+            semantic_exception_ids, null_exception_ids = (
+                load_integrated_quality_exceptions(conn, run_id)
+            )
+
         invalid = count_rows(
             conn,
             """
@@ -440,28 +663,53 @@ def inspect_gold_stage(
             FROM gold.fact_health_integrated fact
             LEFT JOIN gold.bridge_health_indicator_source bridge
                 ON bridge.indicator_key = fact.indicator_key
-            AND bridge.source_key = fact.source_key
-            AND bridge.health_measure_key = fact.health_measure_key
-            AND bridge.variable_key IS NULL
+               AND bridge.source_key = fact.source_key
+               AND bridge.health_measure_key = fact.health_measure_key
+               AND bridge.variable_key IS NULL
             LEFT JOIN gold.dim_geography geography
                 ON geography.geography_key = fact.geography_key
+            LEFT JOIN gold.dim_health_measure measure
+                ON measure.health_measure_key = fact.health_measure_key
             LEFT JOIN gold.dim_prevalence_type prevalence
                 ON prevalence.prevalence_type_key = fact.prevalence_type_key
             WHERE fact.source_run_id = :run_id
-            AND (
+              AND (
                     fact.source_key <> :source_key
-                    OR bridge.mapping_key IS NULL
+
+                    OR (
+                        bridge.mapping_key IS NULL
+                        AND NOT (
+                            fact.integrated_fact_key =
+                            ANY(CAST(:semantic_exception_ids AS BIGINT[]))
+                        )
+                    )
+
                     OR geography.geography_key IS NULL
-                    OR fact.value_numeric IS NULL
+                    OR measure.health_measure_key IS NULL
+
+                    OR (
+                        fact.value_numeric IS NULL
+                        AND NOT (
+                            fact.integrated_fact_key =
+                            ANY(CAST(:null_exception_ids AS BIGINT[]))
+                        )
+                    )
+
                     OR fact.reference_year IS NULL
                     OR fact.reference_year <> 2023
                     OR fact.prevalence_type_key IS NULL
                     OR prevalence.prevalence_type_key IS NULL
                     OR geography.geography_level NOT IN ('COUNTY', 'STATE')
-            )
+              )
             """,
-            {"run_id": run_id, "source_key": source_key},
-            )
+            {
+                "run_id": run_id,
+                "source_key": source_key,
+                "semantic_exception_ids": semantic_exception_ids,
+                "null_exception_ids": null_exception_ids,
+            },
+        )
+
 
         if count == 0 and invalid == 0:
             return False
@@ -471,76 +719,77 @@ def inspect_gold_stage(
         # registros para el run_id y source_key seleccionados.
         # ------------------------------------------------------------
 
-        equivalence = conn.execute(
-            text("""
-                WITH base AS (
+        if not allow_quality_degradation:
+            equivalence = conn.execute(
+                text("""
+                    WITH base AS (
+                        SELECT
+                            bridge.indicator_key,
+                            fact.geography_key,
+                            fact.source_key,
+                            fact.source_run_id,
+                            fact.reference_year,
+                            fact.health_measure_key,
+                            fact.prevalence_type_key,
+                            fact.data_value AS value_numeric
+                        FROM gold.fact_area_health fact
+                        JOIN gold.bridge_health_indicator_source bridge
+                            ON bridge.source_key = fact.source_key
+                           AND bridge.health_measure_key =
+                               fact.health_measure_key
+                           AND bridge.variable_key IS NULL
+                        WHERE fact.source_run_id = :run_id
+                          AND fact.source_key = :source_key
+                    ),
+                    integrated AS (
+                        SELECT
+                            indicator_key,
+                            geography_key,
+                            source_key,
+                            source_run_id,
+                            reference_year,
+                            health_measure_key,
+                            prevalence_type_key,
+                            value_numeric
+                        FROM gold.fact_health_integrated
+                        WHERE source_run_id = :run_id
+                          AND source_key = :source_key
+                    ),
+                    missing_integrated AS (
+                        SELECT * FROM base
+                        EXCEPT ALL
+                        SELECT * FROM integrated
+                    ),
+                    unexpected_integrated AS (
+                        SELECT * FROM integrated
+                        EXCEPT ALL
+                        SELECT * FROM base
+                    )
                     SELECT
-                        bridge.indicator_key,
-                        fact.geography_key,
-                        fact.source_key,
-                        fact.source_run_id,
-                        fact.reference_year,
-                        fact.health_measure_key,
-                        fact.prevalence_type_key,
-                        fact.data_value AS value_numeric
-                    FROM gold.fact_area_health fact
-                    JOIN gold.bridge_health_indicator_source bridge
-                        ON bridge.source_key = fact.source_key
-                       AND bridge.health_measure_key =
-                           fact.health_measure_key
-                       AND bridge.variable_key IS NULL
-                    WHERE fact.source_run_id = :run_id
-                      AND fact.source_key = :source_key
-                ),
-                integrated AS (
-                    SELECT
-                        indicator_key,
-                        geography_key,
-                        source_key,
-                        source_run_id,
-                        reference_year,
-                        health_measure_key,
-                        prevalence_type_key,
-                        value_numeric
-                    FROM gold.fact_health_integrated
-                    WHERE source_run_id = :run_id
-                      AND source_key = :source_key
-                ),
-                missing_integrated AS (
-                    SELECT * FROM base
-                    EXCEPT ALL
-                    SELECT * FROM integrated
-                ),
-                unexpected_integrated AS (
-                    SELECT * FROM integrated
-                    EXCEPT ALL
-                    SELECT * FROM base
-                )
-                SELECT
-                    (
-                        SELECT COUNT(*)
-                        FROM missing_integrated
-                    ) AS missing_integrated,
-                    (
-                        SELECT COUNT(*)
-                        FROM unexpected_integrated
-                    ) AS unexpected_integrated
-            """),
-            {
-                "run_id": run_id,
-                "source_key": source_key,
-            },
-        ).mappings().one()
+                        (
+                            SELECT COUNT(*)
+                            FROM missing_integrated
+                        ) AS missing_integrated,
+                        (
+                            SELECT COUNT(*)
+                            FROM unexpected_integrated
+                        ) AS unexpected_integrated
+                """),
+                {
+                    "run_id": run_id,
+                    "source_key": source_key,
+                },
+            ).mappings().one()
 
-        if (
-            equivalence["missing_integrated"] != 0
-            or equivalence["unexpected_integrated"] != 0
-        ):
-            raise RuntimeError(
-                "Los hechos integrados no coinciden exactamente "
-                "con los hechos territoriales PLACES: "
-                f"{dict(equivalence)}"
-            )
+            if (
+                equivalence["missing_integrated"] != 0
+                or equivalence["unexpected_integrated"] != 0
+            ):
+                raise RuntimeError(
+                    "Los hechos integrados no coinciden exactamente "
+                    "con los hechos territoriales PLACES: "
+                    f"{dict(equivalence)}"
+                )
         
         expected = EXPECTED_GOLD[name]["facts"]
 
@@ -766,7 +1015,11 @@ def ensure_integrated_mappings() -> None:
         engine.dispose()
 
 
-def stage_is_complete(name: str, run_id: int) -> bool:
+def stage_is_complete(
+    name: str,
+    run_id: int,
+    allow_quality_degradation: bool = False,
+) -> bool:
     """Comprueba el estado de una etapa sin modificar la base de datos."""
 
     engine = create_gold_engine()
@@ -782,7 +1035,7 @@ def stage_is_complete(name: str, run_id: int) -> bool:
                     f"Base de datos no autorizada: {database}."
                 )
 
-            return inspect_gold_stage(conn, name, run_id)
+            return inspect_gold_stage(conn, name, run_id, allow_quality_degradation)
 
     finally:
         engine.dispose()
@@ -845,12 +1098,12 @@ def rebuild_gold_for_runs(runs: dict[str, int]) -> None:
 
             if database != DATABASE_ALLOWED:
                 raise RuntimeError(
-                    f"Reconstrucci?n cancelada. "
+                    f"Reconstrucción cancelada. "
                     f"Base no autorizada: {database}."
                 )
 
             logger.warning(
-                "Iniciando reconstrucci?n Gold selectiva. "
+                "Iniciando reconstrucción Gold selectiva. "
                 "Versiones Silver: %s",
                 runs,
             )
@@ -865,7 +1118,7 @@ def rebuild_gold_for_runs(runs: dict[str, int]) -> None:
                 )
 
                 logger.info(
-                    "Reconstrucci?n: %s | run_id=%s | eliminados=%s",
+                    "Reconstrucción: %s | run_id=%s | eliminados=%s",
                     table,
                     run_id,
                     result.rowcount,
@@ -933,6 +1186,41 @@ def acquire_global_pipeline_lock():
                     )
                     conn.invalidate()
             conn.close()
+        engine.dispose()
+
+
+def geography_is_complete() -> bool:
+    """True si Gold Geography ya está cargada y validada; False si está vacía."""
+    engine = create_gold_engine()
+    try:
+        with engine.connect() as conn:
+            database = conn.execute(
+                text("SELECT current_database()")
+            ).scalar_one()
+            if database != DATABASE_ALLOWED:
+                raise RuntimeError(
+                    f"Inspección geográfica bloqueada: base detectada {database}."
+                )
+            counts = conn.execute(
+                text("""
+                    SELECT
+                        COUNT(*) FILTER (WHERE geography_level = 'STATE') AS states,
+                        COUNT(*) FILTER (WHERE geography_level = 'COUNTY') AS counties
+                    FROM gold.dim_geography
+                """)
+            ).mappings().one()
+            states = int(counts["states"])
+            counties = int(counts["counties"])
+
+        # El esquema Gold siembra las 52 jurisdicciones estatales. Ese estado
+        # base (52 estados y cero condados) significa que el ETL Geography
+        # todavía está pendiente, no que exista una carga parcial.
+        geography_state = classify_geography_counts(states, counties)
+        if geography_state == "pending":
+            return False
+        validate_geography_preflight()
+        return True
+    finally:
         engine.dispose()
 
 
@@ -1133,35 +1421,56 @@ def validate_geography_preflight() -> int:
         engine.dispose()
 
 
-def run_preflight_only() -> None:
-    """Ejecuta únicamente validaciones de solo lectura; nunca inicia ETL."""
+def run_preflight_only(
+    require_complete: bool = False,
+    allow_quality_degradation: bool = False,
+) -> None:
+    """Ejecuta validaciones de solo lectura; nunca inicia ETL."""
+    pending = []
     with acquire_global_pipeline_lock():
-        geography_run_id = validate_geography_preflight()
-        logger.info(
-            "Preflight geográfico aprobado | geography_run_id=%s",
-            geography_run_id,
-        )
+        if geography_is_complete():
+            geography_run_id = validate_geography_preflight()
+            logger.info(
+                "Preflight geográfico aprobado | geography_run_id=%s",
+                geography_run_id,
+            )
+        else:
+            logger.info(
+                "Estado Gold | etapa=Geografía | pendiente (dim_geography está vacía)."
+            )
+            pending.append("Geografía")
 
         runs = select_source_runs()
         logger.info("Ejecuciones Silver seleccionadas: %s", runs)
 
         for name, run_id in runs.items():
-            is_complete = stage_is_complete(name, run_id)
+            is_complete = stage_is_complete(name, run_id, allow_quality_degradation)
             logger.info(
                 "Estado Gold | etapa=%s | silver_run_id=%s | %s",
                 name,
                 run_id,
                 "completa y validada" if is_complete else "pendiente",
             )
+            if not is_complete:
+                pending.append(name)
 
         integrated_complete = stage_is_complete(
-            "Integración PLACES", runs["PLACES"]
+            "Integración PLACES",
+            runs["PLACES"],
+            allow_quality_degradation,
         )
         logger.info(
             "Estado Gold | etapa=Integración PLACES | silver_run_id=%s | %s",
             runs["PLACES"],
             "completa y validada" if integrated_complete else "pendiente",
         )
+        if not integrated_complete:
+            pending.append("Integración PLACES")
+        if require_complete and pending:
+            raise RuntimeError(
+                "El escenario no está completo; se requiere intervención: "
+                + ", ".join(pending)
+            )
         logger.info(
             "Preflight-only finalizado. No se ejecutaron ETL ni operaciones DML."
         )
@@ -1171,15 +1480,19 @@ def run_pipeline(rebuild: bool = False) -> None:
     """Ejecuta Gold en orden controlado, bajo bloqueo global y con preflight."""
     with acquire_global_pipeline_lock():
         # Gold necesita primero los 83 condados procedentes de Silver.
-        # El run_id se obtiene de etl_runs; nunca queda fijado en el código.
+        # Si Geography ya está completa, se valida y se omite. Si está vacía,
+        # se ejecuta. Cualquier carga parcial detiene el pipeline sin borrarla.
         geography_run_id = select_latest_geography_run()
-        execute_stage(
-            name="Geografía",
-            module="scripts.gold.etl_gold_geography",
-            arguments=["--source-run-id", str(geography_run_id)],
-        )
-
-        validated_geography_run_id = validate_geography_preflight()
+        if geography_is_complete():
+            logger.info("Etapa omitida: Geografía ya está completa y validada.")
+            validated_geography_run_id = validate_geography_preflight()
+        else:
+            execute_stage(
+                name="Geografía",
+                module="scripts.gold.etl_gold_geography",
+                arguments=["--source-run-id", str(geography_run_id)],
+            )
+            validated_geography_run_id = validate_geography_preflight()
         if validated_geography_run_id != geography_run_id:
             raise RuntimeError(
                 "El preflight validó una ejecución geográfica distinta de la "
@@ -1254,6 +1567,20 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--require-complete",
+        action="store_true",
+        help="Con --preflight-only, falla si alguna etapa Gold está pendiente.",
+    )
+    parser.add_argument(
+        "--allow-quality-degradation",
+        action="store_true",
+        help=(
+            "Con --preflight-only, valida estructura y conteos sin exigir igualdad "
+            "de valores entre hechos PLACES e integrados, que pueden haberse "
+            "degradado independientemente."
+        ),
+    )
+    parser.add_argument(
         "--rebuild",
         action="store_true",
         help=(
@@ -1266,10 +1593,17 @@ def main() -> int:
 
     if args.preflight_only and args.rebuild:
         parser.error("--preflight-only y --rebuild son opciones incompatibles.")
+    if args.require_complete and not args.preflight_only:
+        parser.error("--require-complete requiere --preflight-only.")
+    if args.allow_quality_degradation and not args.preflight_only:
+        parser.error("--allow-quality-degradation requiere --preflight-only.")
 
     try:
         if args.preflight_only:
-            run_preflight_only()
+            run_preflight_only(
+                require_complete=args.require_complete,
+                allow_quality_degradation=args.allow_quality_degradation,
+            )
         else:
             run_pipeline(rebuild=args.rebuild)
         return 0

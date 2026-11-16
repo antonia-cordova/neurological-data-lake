@@ -9,19 +9,35 @@ import os
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+
+from dotenv import load_dotenv
 import numpy as np
 import pandas as pd
 import pyreadstat
-from dotenv import load_dotenv
 from sqlalchemy import URL, create_engine, text
 from sqlalchemy.engine import Engine
+from scripts.bronze.parquet_io import (
+    dataset_path,
+    iter_parquet_frames,
+    parquet_dataset,
+    selected_frequency,
+    validate_dataset_manifest,
+)
 from scripts.silver.silver_budget import (
     enforce_silver_budget,
     lock_silver_budget,
 )
 
+from scripts.database_config import get_target_database
+
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE_DIR = ROOT / "data" / "bronze" / "brfss_2023"
+LANDING_SOURCE_DIR = ROOT / "data" / "landing" / "brfss_2023"
+LEGACY_SOURCE_DIR = ROOT / "data" / "bronze" / "brfss_2023"
+SOURCE_DIR = (
+    LANDING_SOURCE_DIR
+    if (LANDING_SOURCE_DIR / "LLCP2023.XPT").is_file()
+    else LEGACY_SOURCE_DIR
+)
 XPT_FILE = SOURCE_DIR / "LLCP2023.XPT"
 CODEBOOK_FILE = SOURCE_DIR / "USCODE23_LLCP_021924.HTML"
 
@@ -51,7 +67,7 @@ logger = logging.getLogger("etl_brfss")
 def create_db_engine() -> Engine:
     load_dotenv(ROOT / ".env", override=False)
 
-    allowed_database = "health_datalake"
+    allowed_database = get_target_database()
     allowed_host = "localhost"
     allowed_port = 5432
 
@@ -260,13 +276,42 @@ def normalize_state_fips(value: Any) -> str:
 
 
 def read_chunks():
+    if selected_frequency() is not None:
+        validate_dataset_manifest("brfss_2023")
+        parquet_dir = dataset_path("brfss_2023")
+        schema = parquet_dataset(parquet_dir).schema
+        source_columns = [
+            name for name in schema.names
+            if name not in {
+                "source_record_id", "source_dataset", "source_file",
+                "simulated_received_date", "ingestion_sequence",
+                "ingestion_batch_id", "ingestion_scenario",
+                "is_simulated_ingestion", "source_row_hash",
+            }
+        ]
+        if len(source_columns) != EXPECTED_VARIABLES:
+            raise ValueError(
+                "El Bronze Parquet BRFSS no conserva las 350 variables originales: "
+                f"se encontraron {len(source_columns)}."
+            )
+        for chunk in iter_parquet_frames(
+            parquet_dir,
+            batch_size=CHUNK_SIZE,
+            columns=source_columns,
+        ):
+            yield chunk, None
+        return
+
     def read_xport_with_encoding(file_path, **kwargs):
         return pyreadstat.read_xport(
             file_path, encoding="windows-1252", **kwargs
         )
-    return pyreadstat.read_file_in_chunks(
-        read_xport_with_encoding, str(XPT_FILE),
-        chunksize=CHUNK_SIZE, output_format="pandas",
+
+    yield from pyreadstat.read_file_in_chunks(
+        read_xport_with_encoding,
+        str(XPT_FILE),
+        chunksize=CHUNK_SIZE,
+        output_format="pandas",
     )
 
 
@@ -510,9 +555,16 @@ def load_data(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Carga muestra estratificada BRFSS 2023 (20 variables) y valida presupuesto Silver."
+        description=(
+            "Carga muestra estratificada BRFSS 2023 (20 variables) "
+            "y valida presupuesto Silver."
+        )
     )
-    parser.add_argument("--replace", action="store_true", help="Reemplaza la tabla dentro de la transacción.")
+    parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="Reemplaza la tabla dentro de la transacción.",
+    )
     args = parser.parse_args()
 
     validate_source_files()

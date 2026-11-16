@@ -3,17 +3,26 @@ import argparse
 import logging
 import os
 from pathlib import Path
-import pandas as pd
+
 from dotenv import load_dotenv
+import pandas as pd
 from sqlalchemy import URL, create_engine, text
 from sqlalchemy.engine import Engine
+from scripts.bronze.parquet_io import (
+    dataset_path,
+    read_parquet_frame,
+    selected_frequency,
+    validate_dataset_manifest,
+)
 from scripts.silver.silver_budget import (
     enforce_silver_budget,
     lock_silver_budget,
 )
 
+from scripts.database_config import get_target_database
+
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE_DIR = ROOT / "data" / "bronze" / "acs_2024"
+SOURCE_DIR = ROOT / "data" / "landing" / "acs_2024"
 DATASET_NAME = "acs_2024"
 TARGET_TABLE = "silver_acs_2024"
 EXPECTED_SOURCE_COLUMNS = [
@@ -47,10 +56,17 @@ def locate_source_file(explicit_path: str | None = None) -> Path:
             raise FileNotFoundError(f"No se encontró el CSV ACS: {path}")
         return path
 
+    if selected_frequency() is not None:
+        validate_dataset_manifest("acs_2024")
+        return dataset_path("acs_2024")
+
     candidates = sorted(SOURCE_DIR.glob("ACSDP*Y2024.DP05*.csv"))
     if not candidates:
+        legacy_dir = ROOT / "data" / "bronze" / "acs_2024"
+        candidates = sorted(legacy_dir.glob("ACSDP*Y2024.DP05*.csv"))
+    if not candidates:
         raise FileNotFoundError(
-            f"No se encontró ACSDP*Y2024.DP05*.csv en {SOURCE_DIR}"
+            "No se encontró ACSDP*Y2024.DP05*.csv en Landing ni en Bronze heredado."
         )
     if len(candidates) > 1:
         names = "\n".join(f" - {p.name}" for p in candidates)
@@ -66,7 +82,7 @@ def locate_source_file(explicit_path: str | None = None) -> Path:
 def create_db_engine() -> Engine:
     load_dotenv(ROOT / ".env", override=False)
 
-    allowed_database = "health_datalake"
+    allowed_database = get_target_database()
     allowed_host = "localhost"
     allowed_port = 5432
 
@@ -145,13 +161,21 @@ def create_db_engine() -> Engine:
         raise
 
 def validate_source_file(source_file: Path) -> pd.DataFrame:
-    # Se conservan como texto los símbolos ACS: *****, (X), ±, comas y %.
-    df = pd.read_csv(
-        source_file,
-        dtype=str,
-        keep_default_na=False,
-        encoding="utf-8-sig",
-    )
+    # En el flujo maestro, Silver consume exclusivamente el Parquet simulado.
+    # La lectura CSV queda como compatibilidad para ejecuciones heredadas.
+    if source_file.is_dir():
+        table = read_parquet_frame(source_file, columns=EXPECTED_SOURCE_COLUMNS)
+        df = table.to_pandas()
+        for column in EXPECTED_SOURCE_COLUMNS:
+            df[column] = df[column].fillna("").astype(str)
+    else:
+        # Se conservan como texto los símbolos ACS: *****, (X), ±, comas y %.
+        df = pd.read_csv(
+            source_file,
+            dtype=str,
+            keep_default_na=False,
+            encoding="utf-8-sig",
+        )
 
     actual_columns = list(df.columns)
     if actual_columns != EXPECTED_SOURCE_COLUMNS:
@@ -347,7 +371,10 @@ def main() -> int:
     )
     parser.add_argument(
         "--source",
-        help="Ruta del CSV. Si se omite, se busca ACSDP*Y2024.DP05*.csv en data/bronze/acs_2024.",
+        help=(
+            "Ruta CSV explícita para diagnóstico; sin ella se usa Parquet "
+            "de Bronze Simulator o Landing heredado."
+        ),
     )
     parser.add_argument(
         "--replace",

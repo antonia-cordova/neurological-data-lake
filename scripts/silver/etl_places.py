@@ -6,17 +6,27 @@ import math
 import os
 import re
 from pathlib import Path
-import pandas as pd
+
 from dotenv import load_dotenv
+import pandas as pd
 from sqlalchemy import URL, create_engine, text
 from sqlalchemy.engine import Engine
+from scripts.bronze.parquet_io import (
+    dataset_path,
+    read_parquet_frame,
+    selected_frequency,
+    validate_dataset_manifest,
+)
 from scripts.silver.silver_budget import (
     enforce_silver_budget,
     lock_silver_budget,
 )
 
+from scripts.database_config import get_target_database
+
 ROOT = Path(__file__).resolve().parents[2]
-BRONZE_DIR = ROOT / "data" / "bronze" / "places_2025"
+LANDING_DIR = ROOT / "data" / "landing" / "places_2025"
+LEGACY_DIR = ROOT / "data" / "bronze" / "places_2025"
 TARGET_TABLE = "silver_places_2023"
 TARGET_YEAR = 2023
 DATASET_NAME = "places_2025"
@@ -59,7 +69,7 @@ logger = logging.getLogger("etl_places")
 def create_db_engine() -> Engine:
     load_dotenv(ROOT / ".env", override=False)
 
-    allowed_database = "health_datalake"
+    allowed_database = get_target_database()
     allowed_host = "localhost"
     allowed_port = 5432
 
@@ -139,10 +149,17 @@ def create_db_engine() -> Engine:
 
 
 def find_source_file() -> Path:
-    files = sorted(BRONZE_DIR.glob("*.csv"))
+    if selected_frequency() is not None:
+        validate_dataset_manifest("places_2025")
+        return dataset_path("places_2025")
+    files = sorted(LANDING_DIR.glob("*.csv"))
+    if not files:
+        files = sorted(LEGACY_DIR.glob("*.csv"))
     if len(files) != 1:
         raise FileNotFoundError(
-            f"Se esperaba un único CSV en {BRONZE_DIR}; se encontraron {len(files)}." )
+            "Se esperaba un único CSV PLACES en Landing o Bronze heredado; "
+            f"se encontraron {len(files)}."
+        )
     return files[0]
 
 
@@ -188,13 +205,27 @@ def parse_geo(series: pd.Series) -> tuple[pd.Series, pd.Series]:
 
 def transform_and_sample(source: Path, run_id: int) -> tuple[pd.DataFrame, int, int]:
 
-    df = pd.read_csv(
-        source, dtype="string", keep_default_na=False, na_values=[""],
-        usecols=lambda c: c in {
-            "Year", "StateAbbr", "LocationName", "Measure", "Data_Value_Type",
-            "Data_Value", "LocationID", "MeasureId", "DataValueTypeID",
-            "Geolocation",
-        },
+    source_columns = [
+        "Year", "StateAbbr", "LocationName", "Measure", "Data_Value_Type",
+        "Data_Value", "LocationID", "MeasureId", "DataValueTypeID",
+        "Geolocation",
+    ]
+    if source.is_dir():
+        manifest = validate_dataset_manifest("places_2025")
+        df = read_parquet_frame(source, columns=source_columns).to_pandas()
+        if len(df) != int(manifest["source_rows"]):
+            raise ValueError(
+                "El número de filas PLACES Parquet no coincide con el manifiesto: "
+                f"{len(df)} != {manifest['source_rows']}."
+            )
+        df = df.replace("", pd.NA).astype("string")
+    else:
+        df = pd.read_csv(
+            source,
+            dtype="string",
+            keep_default_na=False,
+            na_values=[""],
+            usecols=source_columns,
         )
 
     source_rows = len(df)

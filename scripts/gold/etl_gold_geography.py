@@ -3,6 +3,7 @@ import json
 import logging
 
 from sqlalchemy import text
+from decimal import Decimal, InvalidOperation
 
 from scripts.gold.db_connection import create_gold_engine
 
@@ -288,6 +289,18 @@ def validate_gold_state_catalog(conn) -> None:
     )
 
 
+def same_numeric_value(left, right) -> bool:
+    """Compara valores numéricos sin depender de su tipo Python."""
+
+    if left is None or right is None:
+        return left is right
+
+    try:
+        return Decimal(str(left)) == Decimal(str(right))
+    except (InvalidOperation, ValueError, TypeError):
+        return False
+    
+
 def validate_existing_counties(conn, records: list[dict]) -> int:
     """Detecta condados existentes y rechaza atributos incompatibles."""
 
@@ -358,10 +371,17 @@ def validate_existing_counties(conn, records: list[dict]) -> int:
                 )
 
         if (
-            existing_row["parent_geography_key"] is None
-            or existing_row["latitude"] != record["latitude"]
-            or existing_row["longitude"] != record["longitude"]
-        ):
+                existing_row["parent_geography_key"] is None
+                or not same_numeric_value(
+                    existing_row["latitude"],
+                    record["latitude"],
+                )
+                or not same_numeric_value(
+                    existing_row["longitude"],
+                    record["longitude"],
+                )
+            ):
+                
             raise RuntimeError(
                 f"El condado {location_id} tiene coordenadas "
                 "o jerarquía incompatibles con Silver."

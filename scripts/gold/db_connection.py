@@ -5,9 +5,10 @@ from dotenv import load_dotenv
 from sqlalchemy import URL, create_engine, text
 from sqlalchemy.engine import Engine
 
+from scripts.database_config import get_target_database
+
 ROOT = Path(__file__).resolve().parents[2]
 
-EXPECTED_DATABASE = "health_datalake"
 EXPECTED_HOST = "localhost"
 EXPECTED_PORT = 5432
 
@@ -33,7 +34,7 @@ def create_gold_engine() -> Engine:
             f"Faltan variables de conexi?n: {', '.join(missing)}"
         )
 
-    database = os.getenv("POSTGRES_DB")
+    database = get_target_database()
     host = os.getenv("POSTGRES_HOST")
 
     try:
@@ -43,10 +44,10 @@ def create_gold_engine() -> Engine:
             "POSTGRES_PORT debe ser un n?mero entero."
         ) from exc
 
-    if database != EXPECTED_DATABASE:
+    if database != get_target_database():
         raise RuntimeError(
             f"Conexi?n bloqueada: base '{database}'. "
-            f"Solo se permite '{EXPECTED_DATABASE}'."
+            f"Base no autorizada para el escenario seleccionado: {database}."
         )
 
     if host != EXPECTED_HOST:
@@ -82,7 +83,7 @@ def create_gold_engine() -> Engine:
                 text("SELECT current_database()")
             ).scalar_one()
 
-            if actual_database != EXPECTED_DATABASE:
+            if actual_database != database:
                 raise RuntimeError(
                     "Conexi?n rechazada: PostgreSQL respondi? "
                     f"con la base '{actual_database}'."

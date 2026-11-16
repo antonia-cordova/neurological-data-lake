@@ -8,6 +8,8 @@ from typing import Any
 import psycopg
 from psycopg import sql
 from dotenv import load_dotenv
+from scripts.database_config import SCENARIOS, get_target_database, resolve_scenario
+from scripts.quality.ground_truth import same_exported_value
 
 ROOT = Path(__file__).resolve().parents[2]
 EXPECTED = {
@@ -101,8 +103,22 @@ def load_config(level):
     if set(c.get("rates",{}))!=expected: raise ValueError(f"{p.name}: rates inválidas")
     if any(not isinstance(v,(int,float)) or not 0<=v<=1 for v in c["rates"].values()):
         raise ValueError(f"{p.name}: las tasas deben estar entre 0 y 1")
-    for k in ("database","source_database","seed"):
-        if k not in c: raise ValueError(f"{p.name}: falta {k}")
+    if "seed" not in c: raise ValueError(f"{p.name}: falta seed")
+    scenario = resolve_scenario()
+    if c.get("scenario") != level or c.get("frequency") != SCENARIOS[level]["frequency"]:
+        raise RuntimeError(f"{p.name}: escenario/frecuencia no corresponden a {level}.")
+    expected_rate = 0.05 if level == "medium" else 0.25
+    if any(float(value) != expected_rate for value in c["rates"].values()):
+        raise RuntimeError(
+            f"{p.name}: las tres dimensiones de {level} deben degradarse "
+            f"exactamente en {expected_rate:.0%}."
+        )
+    if scenario != level:
+        raise RuntimeError(
+            f"Quality Generator {level} no puede operar en el escenario {scenario}."
+        )
+    c["database"] = get_target_database()
+    c["frequency"] = SCENARIOS[scenario]["frequency"]
     return c
 
 def dbcfg(db):
@@ -112,6 +128,30 @@ def dbcfg(db):
     return dict(host=os.getenv("POSTGRES_HOST"),port=int(os.getenv("POSTGRES_PORT","5432")),
                 user=os.getenv("POSTGRES_USER"),password=os.getenv("POSTGRES_PASSWORD"),dbname=db)
 def connect(db,autocommit=False): return psycopg.connect(**dbcfg(db),autocommit=autocommit)
+
+def verify_scenario_metadata(c, level, lock=False):
+    expected = SCENARIOS[level]
+    suffix = " FOR UPDATE" if lock else ""
+    row = c.execute(
+        "SELECT scenario, frequency, quality_level, quality_status "
+        "FROM datalake_control.scenario_metadata WHERE singleton=TRUE" + suffix
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("La base no tiene metadatos de escenario; se rechaza degradarla.")
+    scenario, frequency, quality_level, quality_status = row
+    if (scenario, frequency, quality_level) != (
+        level, expected["frequency"], expected["quality_level"]
+    ):
+        raise RuntimeError(
+            "Los metadatos de la base no corresponden al nivel solicitado: "
+            f"{row}."
+        )
+    if quality_status != "pristine":
+        raise RuntimeError(
+            f"La base {get_target_database()} ya está marcada como {quality_status}; "
+            "no se permite degradarla nuevamente."
+        )
+    return row
 def qt(s,t): return sql.SQL(".").join([sql.Identifier(s),sql.Identifier(t)])
 def inventory(c):
     return set(c.execute("""SELECT table_schema,table_name FROM information_schema.tables
@@ -404,18 +444,19 @@ def build_plan(c,level,cfg):
 
 def write_reports(level,cfg,changes,reports,counts):
     out=ROOT/"quality"/"reports"; out.mkdir(parents=True,exist_ok=True)
-    rulepath=out/f"quality_dry_run_rules_{level}.csv"
+    suffix = "_test" if cfg["database"].endswith("_test") else ""
+    rulepath=out/f"quality_dry_run_rules_{level}{suffix}.csv"
     fields=["table","column","dimension","eligible","target","planned","status","reason"]
     with rulepath.open("w",newline="",encoding="utf-8-sig") as f:
         w=csv.DictWriter(f,fieldnames=fields); w.writeheader()
         for r in reports: w.writerow({k:r.get(k,"") for k in fields})
-    changepath=out/f"quality_dry_run_changes_{level}.csv"
+    changepath=out/f"quality_dry_run_changes_{level}{suffix}.csv"
     fields2=["database","level","schema","table","primary_key","column","original_value","altered_value","rule","dimension","seed","changed_at_utc"]
     with changepath.open("w",newline="",encoding="utf-8-sig") as f:
         w=csv.DictWriter(f,fieldnames=fields2); w.writeheader()
         for x in changes:
             d=x.row(); w.writerow({k:d.get(k,"") for k in fields2})
-    summary=out/f"quality_dry_run_summary_{level}.csv"
+    summary=out/f"quality_dry_run_summary_{level}{suffix}.csv"
     with summary.open("w",newline="",encoding="utf-8-sig") as f:
         fields3=["level","database","rate_accuracy","rate_completeness","rate_semantic_consistency","tables_in_scope","source_rows_total","planned_operations","unique_cells","planned_changes_total","dimension","rules","eligible_cells","planned_changes","partial_or_skipped_rules"]
         w=csv.DictWriter(f,fieldnames=fields3); w.writeheader()
@@ -499,96 +540,184 @@ def preflight_changes(source,changes):
             c.rollback()
     return constraint_count,not_null_count
 
-def table_data_digest(c,s,t,keys):
-    """Huella determinista del contenido completo de una tabla, ordenado por PK."""
-    order=sql.SQL(",").join(sql.Identifier(k) for k in keys)
-    query=sql.SQL("""
-        SELECT md5(COALESCE(string_agg(md5(to_jsonb(x)::text), '' ORDER BY {}), ''))
-        FROM {} AS x
-    """).format(order,qt(s,t))
-    return c.execute(query).fetchone()[0]
+def recover_ground_truth(level):
+    """
+    Reconstruye el JSONL desde el CSV previo a la transacción.
 
-def structural_signature(c):
-    """Firma de columnas, tipos, nulabilidad, defaults, constraints e índices."""
-    columns=c.execute("""
-        SELECT table_schema,table_name,ordinal_position,column_name,
-               data_type,udt_schema,udt_name,is_nullable,column_default
-        FROM information_schema.columns
-        WHERE table_schema IN ('public','gold')
-        ORDER BY table_schema,table_name,ordinal_position
-    """).fetchall()
-    constraints=c.execute("""
-        SELECT n.nspname,t.relname,con.conname,con.contype,
-               pg_get_constraintdef(con.oid,true),con.convalidated
-        FROM pg_constraint con
-        JOIN pg_class t ON t.oid=con.conrelid
-        JOIN pg_namespace n ON n.oid=t.relnamespace
-        WHERE n.nspname IN ('public','gold')
-        ORDER BY n.nspname,t.relname,con.conname
-    """).fetchall()
-    indexes=c.execute("""
-        SELECT schemaname,tablename,indexname,indexdef
-        FROM pg_indexes
-        WHERE schemaname IN ('public','gold')
-        ORDER BY schemaname,tablename,indexname
-    """).fetchall()
-    payload=json.dumps(
-        {"columns":columns,"constraints":constraints,"indexes":indexes},
-        default=str,ensure_ascii=False,separators=(",",":")
+    Solo exporta si la base ya está marcada como degraded y cada valor actual
+    coincide con el valor alterado registrado en el CSV. No ejecuta UPDATE.
+    """
+    cfg = load_config(level)
+    target = cfg["database"]
+    suffix = "_test" if target.endswith("_test") else ""
+    report = ROOT / "quality" / "reports" / f"quality_dry_run_changes_{level}{suffix}.csv"
+    output = ROOT / "quality" / "ground_truth" / f"ground_truth_{level}{suffix}.jsonl"
+
+    if not report.is_file():
+        raise FileNotFoundError(
+            "No se puede recuperar Ground Truth: falta el informe de cambios "
+            f"previo a la degradación ({report})."
+        )
+
+    summary_path = ROOT / "quality" / "reports" / f"quality_dry_run_summary_{level}{suffix}.csv"
+    if not summary_path.is_file():
+        raise FileNotFoundError(
+            "No se puede verificar la integridad del Ground Truth: "
+            f"falta el resumen de cambios ({summary_path})."
+        )
+
+    with summary_path.open("r", newline="", encoding="utf-8-sig") as stream:
+        summary_rows = list(csv.DictReader(stream))
+    if not summary_rows:
+        raise RuntimeError("El resumen de cambios está vacío.")
+    try:
+        expected_change_count = int(summary_rows[0]["planned_changes_total"])
+        expected_unique_cells = int(summary_rows[0]["unique_cells"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("El resumen de cambios no contiene conteos válidos.") from exc
+
+    with connect(target) as conn:
+        metadata = conn.execute(
+            """
+            SELECT scenario, frequency, quality_level, quality_status
+            FROM datalake_control.scenario_metadata
+            WHERE singleton=TRUE
+            """
+        ).fetchone()
+        if metadata is None or metadata != (
+            level, SCENARIOS[level]["frequency"], level, "degraded"
+        ):
+            raise RuntimeError(
+                "La base no está marcada como degradada para el escenario solicitado; "
+                f"metadatos={metadata!r}."
+            )
+
+        exported = []
+        seen = set()
+        with report.open("r", newline="", encoding="utf-8-sig") as stream:
+            reader = csv.DictReader(stream)
+            required = {
+                "database", "level", "schema", "table", "primary_key",
+                "column", "original_value", "altered_value", "rule",
+                "dimension", "seed", "changed_at_utc",
+            }
+            if not required.issubset(set(reader.fieldnames or [])):
+                raise RuntimeError(
+                    f"El CSV Ground Truth no contiene las columnas requeridas: "
+                    f"{sorted(required - set(reader.fieldnames or []))}."
+                )
+
+            for line_number, row in enumerate(reader, start=2):
+                if row["database"] != target or row["level"] != level:
+                    raise RuntimeError(
+                        f"El CSV no corresponde a {target}/{level}, línea {line_number}."
+                    )
+                schema_name = row["schema"]
+                table_name = row["table"]
+                column_name = row["column"]
+                if schema_name not in {"public", "gold"}:
+                    raise RuntimeError(
+                        f"Esquema no permitido en CSV, línea {line_number}: {schema_name!r}."
+                    )
+                try:
+                    primary_key = json.loads(row["primary_key"])
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"Clave primaria inválida en CSV, línea {line_number}."
+                    ) from exc
+                if not isinstance(primary_key, dict) or not primary_key:
+                    raise RuntimeError(
+                        f"Clave primaria vacía o inválida en CSV, línea {line_number}."
+                    )
+                identity = (
+                    schema_name, table_name,
+                    json.dumps(primary_key, sort_keys=True, default=str),
+                    column_name,
+                )
+                if identity in seen:
+                    raise RuntimeError(
+                        f"Cambio duplicado en CSV, línea {line_number}: {identity}."
+                    )
+                seen.add(identity)
+
+                where = sql.SQL(" AND ").join(
+                    sql.SQL("{} IS NOT DISTINCT FROM %s").format(sql.Identifier(key))
+                    for key in primary_key
+                )
+                query = sql.SQL("SELECT {} FROM {} WHERE {}").format(
+                    sql.Identifier(column_name),
+                    qt(schema_name, table_name),
+                    where,
+                )
+                values = list(primary_key.values())
+                matches = conn.execute(query, values).fetchall()
+                if len(matches) != 1:
+                    raise RuntimeError(
+                        f"No se pudo identificar una única celda para Ground Truth, "
+                        f"línea {line_number}: filas={len(matches)}."
+                    )
+                if not same_exported_value(matches[0][0], row["altered_value"]):
+                    raise RuntimeError(
+                        f"El valor actual no coincide con el valor alterado del CSV, "
+                        f"línea {line_number}: {schema_name}.{table_name}.{column_name}."
+                    )
+
+                try:
+                    seed = int(row["seed"])
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"Seed inválida en CSV, línea {line_number}."
+                    ) from exc
+
+                exported.append({
+                    "database": row["database"],
+                    "level": row["level"],
+                    "schema": schema_name,
+                    "table": table_name,
+                    "primary_key": row["primary_key"],
+                    "column": column_name,
+                    "original_value": row["original_value"] or None,
+                    "altered_value": row["altered_value"] or None,
+                    "rule": row["rule"],
+                    "dimension": row["dimension"],
+                    "seed": seed,
+                    "changed_at_utc": row["changed_at_utc"],
+                })
+
+    if not exported:
+        raise RuntimeError("El CSV de cambios está vacío; no se puede recuperar Ground Truth.")
+    if len(exported) != expected_change_count or len(seen) != expected_unique_cells:
+        raise RuntimeError(
+            "El CSV de cambios no coincide con el resumen previo a la degradación: "
+            f"cambios={len(exported)}/{expected_change_count}, "
+            f"celdas_únicas={len(seen)}/{expected_unique_cells}."
+        )
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", encoding="utf-8") as stream:
+        for row in exported:
+            stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    print(
+        f"GROUND TRUTH RECUPERADO: {output.relative_to(ROOT)} | "
+        f"cambios verificados={len(exported):,} | base={target}. "
+        "No se modificaron datos en PostgreSQL."
     )
-    import hashlib
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-def source_snapshot(source):
-    """Captura inventario, conteos, estructura y huellas de datos."""
-    with connect(source) as c:
+
+def run(level,execute):
+    cfg=load_config(level)
+    target=cfg["database"]
+    with connect(target) as c:
+        verify_scenario_metadata(c, level)
         inv=inventory(c)
         missing=EXPECTED-inv
         if missing:
-            raise RuntimeError(f"Faltan tablas esperadas: {sorted(missing)}")
-        counts={f"{s}.{t}":rowcount(c,s,t) for s,t in sorted(EXPECTED)}
-        digests={}
-        for s,t in sorted(EXPECTED):
-            keys=pkcols(c,s,t)
-            if not keys:
-                raise RuntimeError(f"{s}.{t} no tiene PK; no se puede verificar la copia íntegra.")
-            digests[f"{s}.{t}"]=table_data_digest(c,s,t,keys)
-        return inv,counts,structural_signature(c),digests
-
-def verify_clone(snapshot,target):
-    inv0,counts0,structure0,digests0=snapshot
-    with connect(target) as c:
-        if inventory(c)!=inv0:
-            raise RuntimeError("El clon no conserva exactamente el inventario de tablas.")
-        counts1={f"{s}.{t}":rowcount(c,s,t) for s,t in sorted(EXPECTED)}
-        if counts1!=counts0:
-            raise RuntimeError("El clon no conserva los conteos de filas originales.")
-        if structural_signature(c)!=structure0:
-            raise RuntimeError("El clon no conserva columnas, tipos, constraints o índices.")
-        digests1={}
-        for s,t in sorted(EXPECTED):
-            digests1[f"{s}.{t}"]=table_data_digest(c,s,t,pkcols(c,s,t))
-        if digests1!=digests0:
-            mismatches=[k for k in digests0 if digests0[k]!=digests1.get(k)]
-            raise RuntimeError(f"El clon no conserva íntegramente los datos originales: {mismatches}")
-    return True
-
-def clone(source,target):
-    with connect("postgres",True) as c:
-        if c.execute("SELECT 1 FROM pg_database WHERE datname=%s",(target,)).fetchone():
-            raise RuntimeError(f"{target} ya existe. No se sobrescribirá.")
-        active=c.execute("SELECT count(*) FROM pg_stat_activity WHERE datname=%s AND pid<>pg_backend_pid()",(source,)).fetchone()[0]
-        if active: raise RuntimeError(f"{active} conexión(es) activa(s) en {source}")
-        c.execute(sql.SQL("CREATE DATABASE {} TEMPLATE {}").format(sql.Identifier(target),sql.Identifier(source)))
-
-def run(level,execute):
-    cfg=load_config(level); source=cfg["source_database"]; target=cfg["database"]
-    with connect(source) as c:
-        inv=inventory(c); missing=EXPECTED-inv
-        if missing: raise RuntimeError(f"Faltan tablas: {sorted(missing)}")
+            raise RuntimeError(f"Faltan tablas: {sorted(missing)}")
         counts={f"{s}.{t}":rowcount(c,s,t) for s,t in sorted(EXPECTED)}
         changes,reports=build_plan(c,level,cfg)
-    print(f"\n{'='*72}\n{level.upper()} | {source} -> {target}")
+
+    print(f"\n{'='*72}\n{level.upper()} | base={target} | frecuencia={cfg['frequency']}")
     print(f"Tasas: accuracy {cfg['rates']['accuracy']:.0%} | completeness {cfg['rates']['completeness']:.0%} | semantic consistency {cfg['rates']['semantic_consistency']:.0%}")
     print(f"Tablas: {len(inv)} | Filas fuente: {sum(counts.values()):,}")
     print(f"{'DIMENSIÓN':24} {'REGLAS':>7} {'ELEGIBLES':>12} {'CAMBIOS':>10} {'OMITIDAS/PARCIALES':>20}")
@@ -604,61 +733,58 @@ def run(level,execute):
     print("Informes:")
     for p in paths: print(f"  {p.relative_to(ROOT)}")
     if not execute:
-        print("DRY RUN: solo lectura. No se creó ni modificó ninguna base.")
+        print("DRY RUN: solo lectura. La base permanece intacta.")
         return
+    if not changes:
+        raise RuntimeError("El plan no contiene cambios; se cancela para no marcar la base como degradada.")
 
-    # 1) Captura el estado íntegro de la fuente antes de la clonación.
-    snapshot=source_snapshot(source)
-
-    # 2) Preflight real dentro de una transacción que SIEMPRE se revierte.
-    # PostgreSQL valida CHECK, NOT NULL, FK, UNIQUE y tipos al ejecutar UPDATE.
-    constraint_count,not_null_count=preflight_changes(source,changes)
+    # Preflight transaccional sobre la misma base objetivo; siempre se revierte.
+    constraint_count,not_null_count=preflight_changes(target,changes)
     print(
         f"PREFLIGHT APROBADO: {len(changes):,} operaciones; "
         f"{constraint_count} constraints; {not_null_count} columnas NOT NULL. "
         "Transacción de prueba revertida."
     )
 
-    # 3) CREATE DATABASE ... TEMPLATE.
-    clone(source,target)
-
-    # 4) Verifica estructura y contenido exacto antes de degradar.
-    verify_clone(snapshot,target)
-    print("CLON VERIFICADO: estructura y datos idénticos a la fuente.")
-
-    # 5) Todas las alteraciones se aplican en una sola transacción.
-    # Si falla un UPDATE o una restricción, el context manager hace ROLLBACK.
-    try:
-        with connect(target) as c:
+    # Aplicación atómica: datos y estado de calidad se confirman juntos.
+    # La fila de metadatos se bloquea y se vuelve a validar para evitar doble ejecución.
+    with connect(target) as c:
+        with c.transaction():
+            verify_scenario_metadata(c, level, lock=True)
             apply_changes(c,changes)
             constraint_count_target,not_null_count_target=validate_constraints(c)
+            updated=c.execute(
+                "UPDATE datalake_control.scenario_metadata "
+                "SET quality_status='degraded', degraded_at=clock_timestamp() "
+                "WHERE singleton=TRUE AND quality_status='pristine'"
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("No se pudo marcar la degradación de forma atómica.")
             print(
                 f"VALIDACIÓN POSTERIOR: {constraint_count_target} constraints; "
                 f"{not_null_count_target} columnas NOT NULL."
             )
-    except Exception:
-        # No se borra automáticamente ninguna base. La transacción fallida
-        # queda revertida y el target permanece como clon Perfect intacto.
-        print(
-            f"ERROR AL APLICAR. La transacción fue revertida. "
-            f"{target} permanece como clon intacto de {source}; "
-            "no se ejecutó DROP DATABASE."
-        )
-        raise
 
     gt=ROOT/"quality"/"ground_truth"
     gt.mkdir(parents=True,exist_ok=True)
-    with (gt/f"ground_truth_{level}.jsonl").open("w",encoding="utf-8") as f:
+    suffix = "_test" if target.endswith("_test") else ""
+    with (gt/f"ground_truth_{level}{suffix}.jsonl").open("w",encoding="utf-8") as f:
         for x in changes:
             f.write(json.dumps(x.row(),ensure_ascii=False)+"\n")
-    print(f"BASE CREADA Y VALIDADA: {target}")
+    print(f"BASE DEGRADADA Y VALIDADA: {target}")
 
 def main():
-    p=argparse.ArgumentParser(description="Quality Generator V5: preflight transaccional, verificación de clon y aplicación atómica.")
-    p.add_argument("--level",choices=["medium","poor","both"],default="both")
-    p.add_argument("--execute",action="store_true",help="Clona y aplica exactamente el plan calculado.")
+    p=argparse.ArgumentParser(description="Quality Generator: degradación transaccional in-place y recuperación del Ground Truth.")
+    p.add_argument("--level",choices=["medium","poor"],required=True)
+    p.add_argument("--execute",action="store_true",help="Aplica el plan de degradación a la base del escenario seleccionado.")
+    p.add_argument("--recover-ground-truth",action="store_true",help="Reconstruye el JSONL desde el CSV y verifica los valores actuales; no modifica la base.")
     a=p.parse_args()
-    for level in (["medium","poor"] if a.level=="both" else [a.level]): run(level,a.execute)
+    if a.execute and a.recover_ground_truth:
+        p.error("--execute y --recover-ground-truth son opciones incompatibles.")
+    if a.recover_ground_truth:
+        recover_ground_truth(a.level)
+    else:
+        run(a.level,a.execute)
 if __name__=="__main__":
     try: main()
     except Exception as e:

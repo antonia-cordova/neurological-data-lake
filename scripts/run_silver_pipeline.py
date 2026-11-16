@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import argparse
 import logging
 import os
@@ -7,16 +8,27 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
 from dotenv import load_dotenv
 
+from scripts.database_config import get_target_database
+from scripts.silver.resume import classify_audited_stage
+
 ROOT = Path(__file__).resolve().parents[1]
+EXPECTED_ROWS = {
+    "acs": 113,
+    "brfss": 2800,
+    "places": 2490,
+    "acs_county": 332,
+    "geography": 215,
+}
+CATALOG_MIN_INDICATORS = 100
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-
 logger = logging.getLogger("silver_pipeline")
 
 
@@ -24,271 +36,317 @@ logger = logging.getLogger("silver_pipeline")
 class ETLJob:
     name: str
     module: str
-    rebuild_args: tuple[str, ...]
+    dataset_name: str | None = None
+    target_table: str | None = None
 
 
-# Orden de ejecución: ACS/BRFSS/PLACES, ACS County y finalmente Geography.
-# Geography depende de los catálogos territoriales de ACS County y PLACES.
 JOBS = {
-    "acs": ETLJob(
-        name="ACS nacional",
-        module="scripts.silver.etl_acs",
-        rebuild_args=("--replace",),
-    ),
+    "acs": ETLJob("ACS nacional", "scripts.silver.etl_acs", "acs_2024", "silver_acs_2024"),
     "brfss": ETLJob(
-        name="BRFSS",
-        module="scripts.silver.etl_brfss",
-        rebuild_args=("--replace",),
+        "BRFSS", "scripts.silver.etl_brfss", "brfss_2023",
+        "silver_respondent+silver_brfss_2023",
     ),
     "places": ETLJob(
-        name="PLACES",
-        module="scripts.silver.etl_places",
-        rebuild_args=("--replace",),
+        "PLACES", "scripts.silver.etl_places", "places_2025", "silver_places_2023"
     ),
     "acs_county": ETLJob(
-        name="ACS County",
-        module="scripts.silver.etl_acs_county",
-        rebuild_args=("--replace-existing",),
+        "ACS County", "scripts.silver.etl_acs_county",
+        "acs_2024_county_dp05", "silver_acs_county_2024",
     ),
-    "catalogs": ETLJob(
-        name="Catálogos de fuentes e indicadores",
-        module="scripts.silver.etl_health_catalog",
-        rebuild_args=(),
-    ),
+    "catalogs": ETLJob("Catálogos de fuentes e indicadores", "scripts.silver.etl_health_catalog"),
     "geography": ETLJob(
-        name="Geography",
-        module="scripts.silver.etl_geography",
-        rebuild_args=(),
+        "Geography", "scripts.silver.etl_geography",
+        "geography_catalog", "silver_geography+silver_county",
     ),
 }
 
 
-def validate_target_configuration() -> None:
-    """
-    Impide ejecutar el pipeline si la configuración
-    no corresponde a la base de reproducción.
-    """
+def validate_target_configuration() -> str:
     load_dotenv(ROOT / ".env", override=False)
-
-    expected = {
-        "POSTGRES_DB": "health_datalake",
-        "POSTGRES_HOST": "localhost",
-        "POSTGRES_PORT": "5432",
-    }
-
-    for variable, expected_value in expected.items():
-        actual_value = os.getenv(variable)
-
-        if actual_value != expected_value:
-            raise RuntimeError(
-                f"Configuración PostgreSQL rechazada: "
-                f"{variable} debe ser {expected_value!r}; "
-                f"valor actual: {actual_value!r}."
-            )
-
-    required = [
-        "POSTGRES_USER",
-        "POSTGRES_PASSWORD",
-    ]
-
-    missing = [
-        variable
-        for variable in required
-        if not os.getenv(variable)
-    ]
-
+    target_database = get_target_database()
+    required = ["POSTGRES_USER", "POSTGRES_PASSWORD"]
+    missing = [variable for variable in required if not os.getenv(variable)]
     if missing:
-        raise RuntimeError(
-            f"Faltan variables PostgreSQL: {', '.join(missing)}"
-        )
-
+        raise RuntimeError(f"Faltan variables PostgreSQL: {', '.join(missing)}")
     logger.info(
-        "Configuración de reproducción validada: "
-        "localhost:5432 / health_datalake"
+        "Configuración PostgreSQL validada: localhost:5432 / %s",
+        target_database,
+    )
+    return target_database
+
+
+def connect_target():
+    import psycopg
+
+    load_dotenv(ROOT / ".env", override=False)
+    database = validate_target_configuration()
+    return psycopg.connect(
+        host=os.getenv("POSTGRES_HOST", "localhost"),
+        port=int(os.getenv("POSTGRES_PORT", "5432")),
+        dbname=database,
+        user=os.environ["POSTGRES_USER"],
+        password=os.environ["POSTGRES_PASSWORD"],
+        connect_timeout=5,
     )
 
 
-def execute_job(
-    job: ETLJob,
-    rebuild: bool = False,
-) -> tuple[bool, float]:
+def latest_etl_run(conn, job: ETLJob):
+    row = conn.execute(
+        """
+        SELECT run_id, status, loaded_rows, finished_at
+        FROM public.etl_runs
+        WHERE dataset_name = %s AND target_table = %s
+        ORDER BY run_id DESC
+        LIMIT 1
+        """,
+        (job.dataset_name, job.target_table),
+    ).fetchone()
+    return row
 
+
+def inspect_job_state(conn, key: str) -> str:
+    """Devuelve complete/pending; detiene la ejecución ante cualquier estado parcial."""
+    job = JOBS[key]
+
+    if key == "catalogs":
+        source_count = conn.execute(
+            "SELECT COUNT(*) FROM public.silver_source"
+        ).fetchone()[0]
+        indicator_count = conn.execute(
+            "SELECT COUNT(*) FROM public.silver_health_indicator"
+        ).fetchone()[0]
+        if source_count == 0 and indicator_count == 0:
+            return "pending"
+        if source_count == 4 and indicator_count >= CATALOG_MIN_INDICATORS:
+            return "complete"
+        raise RuntimeError(
+            "Catálogos Silver parciales o inconsistentes: "
+            f"fuentes={source_count}/4, indicadores={indicator_count} "
+            f"(mínimo={CATALOG_MIN_INDICATORS})."
+        )
+
+    if key == "acs":
+        counts = conn.execute(
+            """
+            SELECT COUNT(*), COUNT(*) FILTER (WHERE run_id = (
+                SELECT run_id FROM public.etl_runs
+                WHERE dataset_name=%s AND target_table=%s
+                ORDER BY run_id DESC LIMIT 1
+            ))
+            FROM public.silver_acs_2024
+            """,
+            (job.dataset_name, job.target_table),
+        ).fetchone()
+        total, run_rows = map(int, counts)
+
+    elif key == "places":
+        counts = conn.execute(
+            """
+            SELECT COUNT(*), COUNT(*) FILTER (WHERE run_id = (
+                SELECT run_id FROM public.etl_runs
+                WHERE dataset_name=%s AND target_table=%s
+                ORDER BY run_id DESC LIMIT 1
+            ))
+            FROM public.silver_places_2023
+            """,
+            (job.dataset_name, job.target_table),
+        ).fetchone()
+        total, run_rows = map(int, counts)
+
+    elif key == "acs_county":
+        counts = conn.execute(
+            """
+            SELECT COUNT(*), COUNT(*) FILTER (WHERE run_id = (
+                SELECT run_id FROM public.etl_runs
+                WHERE dataset_name=%s AND target_table=%s
+                ORDER BY run_id DESC LIMIT 1
+            ))
+            FROM public.silver_acs_county_2024
+            """,
+            (job.dataset_name, job.target_table),
+        ).fetchone()
+        total, run_rows = map(int, counts)
+
+    elif key == "brfss":
+        latest = latest_etl_run(conn, job)
+        run_id = latest[0] if latest else None
+        if run_id is None:
+            respondents = int(conn.execute(
+                "SELECT COUNT(*) FROM public.silver_respondent"
+            ).fetchone()[0])
+            responses = int(conn.execute(
+                "SELECT COUNT(*) FROM public.silver_brfss_2023"
+            ).fetchone()[0])
+            if respondents == 0 and responses == 0:
+                return "pending"
+            raise RuntimeError(
+                "BRFSS contiene datos, pero no existe una ejecución ETL auditable."
+            )
+        respondents, responses, invalid = conn.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM public.silver_respondent WHERE run_id=%s),
+                (SELECT COUNT(*) FROM public.silver_brfss_2023 r
+                 JOIN public.silver_respondent p ON p.respondent_id=r.respondent_id
+                 WHERE p.run_id=%s),
+                (SELECT COUNT(*) FROM public.silver_brfss_2023 r
+                 JOIN public.silver_respondent p ON p.respondent_id=r.respondent_id
+                 WHERE p.run_id=%s AND
+                   (jsonb_typeof(r.record_data) <> 'object'
+                    OR (SELECT COUNT(*) FROM jsonb_object_keys(r.record_data)) <> 20))
+            """,
+            (run_id, run_id, run_id),
+        ).fetchone()
+        total_respondents = int(conn.execute(
+            "SELECT COUNT(*) FROM public.silver_respondent"
+        ).fetchone()[0])
+        total_responses = int(conn.execute(
+            "SELECT COUNT(*) FROM public.silver_brfss_2023"
+        ).fetchone()[0])
+        if latest[1] == "succeeded" and latest[3] is not None:
+            if (
+                int(latest[2]) == EXPECTED_ROWS[key]
+                and int(respondents) == EXPECTED_ROWS[key]
+                and int(responses) == EXPECTED_ROWS[key]
+                and total_respondents == EXPECTED_ROWS[key]
+                and total_responses == EXPECTED_ROWS[key]
+                and int(invalid) == 0
+            ):
+                return "complete"
+        raise RuntimeError(
+            "BRFSS está incompleto o inconsistente: "
+            f"última ejecución={latest}, respondents={respondents}/{EXPECTED_ROWS[key]}, "
+            f"responses={responses}/{EXPECTED_ROWS[key]}, inválidas={invalid}."
+        )
+
+    elif key == "geography":
+        latest = latest_etl_run(conn, job)
+        states, counties, county_catalog = conn.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM public.silver_geography WHERE geography_level='STATE'),
+                (SELECT COUNT(*) FROM public.silver_geography WHERE geography_level='COUNTY'),
+                (SELECT COUNT(*) FROM public.silver_county)
+            """
+        ).fetchone()
+        states, counties, county_catalog = map(int, (states, counties, county_catalog))
+        if latest is None:
+            if states == counties == county_catalog == 0:
+                return "pending"
+            raise RuntimeError(
+                "Geography contiene datos, pero no existe una ejecución ETL auditable."
+            )
+        if (
+            latest[1] == "succeeded"
+            and latest[3] is not None
+            and int(latest[2]) == EXPECTED_ROWS[key]
+            and (states, counties, county_catalog) == (49, 83, 83)
+        ):
+            return "complete"
+        raise RuntimeError(
+            "Geography está incompleta o inconsistente: "
+            f"última ejecución={latest}, estados={states}/49, "
+            f"condados={counties}/83, catálogo_condados={county_catalog}/83."
+        )
+
+    else:
+        latest = latest_etl_run(conn, job)
+        if latest is None:
+            if total == 0 and run_rows == 0:
+                return "pending"
+            raise RuntimeError(
+                f"{job.name} contiene datos, pero no existe una ejecución ETL auditable."
+            )
+        if (
+            latest[1] == "succeeded"
+            and latest[3] is not None
+            and int(latest[2]) == EXPECTED_ROWS[key]
+            and total == EXPECTED_ROWS[key]
+            and run_rows == EXPECTED_ROWS[key]
+        ):
+            return "complete"
+        raise RuntimeError(
+            f"{job.name} está incompleto o inconsistente: última ejecución={latest}, "
+            f"filas_totales={total}, filas_de_último_run={run_rows}, "
+            f"esperadas={EXPECTED_ROWS[key]}."
+        )
+
+    latest = latest_etl_run(conn, job)
+    return classify_audited_stage(
+        latest,
+        (total, run_rows),
+        EXPECTED_ROWS[key],
+        job.name,
+    )
+
+
+def execute_job(job: ETLJob) -> float:
     logger.info("=" * 65)
     logger.info("INICIANDO ETL: %s", job.name)
-    logger.info("=" * 65)
-
-    command = [
-        sys.executable,
-        "-m",
-        job.module,
-    ]
-
-    if rebuild:
-        command.extend(job.rebuild_args)
-        logger.info(
-            "Modo reconstrucción: %s",
-            " ".join(job.rebuild_args),
-        )
-
+    command = [sys.executable, "-m", job.module]
+    logger.info("COMANDO: %s", " ".join(command))
     started = time.perf_counter()
-
-    try:
-        result = subprocess.run(
-            command,
-            cwd=ROOT,
-            check=False,
+    result = subprocess.run(command, cwd=ROOT, check=False)
+    duration = time.perf_counter() - started
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ETL {job.name} falló con código {result.returncode} "
+            f"después de {duration:.2f} segundos."
         )
-
-        duration = time.perf_counter() - started
-
-        if result.returncode != 0:
-            logger.error(
-                "ETL %s fallido | código=%s | duración=%.2f segundos",
-                job.name,
-                result.returncode,
-                duration,
-            )
-            return False, duration
-
-        logger.info(
-            "ETL %s completado | duración=%.2f segundos",
-            job.name,
-            duration,
-        )
-
-        return True, duration
-
-    except Exception:
-        duration = time.perf_counter() - started
-        logger.exception("Error ejecutando ETL %s", job.name)
-        return False, duration
+    logger.info("ETL %s completado | duración=%.2f segundos", job.name, duration)
+    return duration
 
 
 def main() -> int:
-
     parser = argparse.ArgumentParser(
         description=(
-            "Orquestador secuencial de la capa Silver "
-            "del neurological-data-lake."
+            "Orquestador Silver con reanudación validada. Omite ETL completos "
+            "y se detiene ante cargas parciales o inconsistentes."
         )
     )
-
     parser.add_argument(
-        "--only",
-        choices=list(JOBS.keys()),
-        help="Ejecuta solamente el ETL seleccionado.",
+        "--only", choices=list(JOBS),
+        help="Ejecuta o valida solamente la etapa seleccionada.",
     )
-
     parser.add_argument(
-        "--rebuild",
-        action="store_true",
-        help=(
-            "Reconstruye las tablas existentes utilizando "
-            "los argumentos de reemplazo de cada ETL."
-        ),
+        "--validate-only", action="store_true",
+        help="Solo valida las seis etapas; falla si alguna está pendiente.",
     )
-
     args = parser.parse_args()
 
     try:
         validate_target_configuration()
-    except Exception as exc:
-        logger.error("Prevalidación fallida: %s", exc)
-        return 1
-
-    selected_jobs = (
-        [JOBS[args.only]]
-        if args.only
-        else list(JOBS.values())
-    )
-
-    logger.info("=" * 65)
-    logger.info("INICIO PIPELINE SILVER")
-    logger.info("ETL seleccionados: %s", len(selected_jobs))
-    logger.info(
-        "Modo: %s",
-        "RECONSTRUCCIÓN" if args.rebuild else "CARGA NORMAL",
-    )
-    logger.info("=" * 65)
-
-    pipeline_started = time.perf_counter()
-    results = []
-
-    for job in selected_jobs:
-
-        success, duration = execute_job(
-            job,
-            rebuild=args.rebuild,
-        )
-
-        results.append(
-            {
-                "name": job.name,
-                "success": success,
-                "duration": duration,
-            }
-        )
-
-        if not success:
-            logger.error(
-                "Pipeline detenido. "
-                "No se ejecutarán los siguientes ETL."
-            )
-            break
-
-    total_duration = time.perf_counter() - pipeline_started
-
-    logger.info("=" * 65)
-    logger.info("RESUMEN PIPELINE SILVER")
-    logger.info("=" * 65)
-
-    for result in results:
-
-        status = "OK" if result["success"] else "ERROR"
+        selected = [args.only] if args.only else list(JOBS)
+        durations = []
+        for key in selected:
+            job = JOBS[key]
+            with connect_target() as conn:
+                state = inspect_job_state(conn, key)
+            if state == "complete":
+                logger.info("ETL omitido: %s ya está completo y validado.", job.name)
+                continue
+            if args.validate_only:
+                raise RuntimeError(
+                    f"Validación-only: {job.name} está pendiente; no se ejecutó."
+                )
+            logger.info("ETL pendiente: %s. Se ejecutará sin reconstrucción.", job.name)
+            durations.append(execute_job(job))
+            with connect_target() as conn:
+                final_state = inspect_job_state(conn, key)
+            if final_state != "complete":
+                raise RuntimeError(
+                    f"{job.name} terminó, pero sus resultados no superaron la validación."
+                )
+            logger.info("ETL validado correctamente: %s.", job.name)
 
         logger.info(
-            "%-15s | %-5s | %.2f segundos",
-            result["name"],
-            status,
-            result["duration"],
+            "PIPELINE SILVER COMPLETADO | etapas=%s | ejecuciones=%s | duración=%.2f s",
+            len(selected), len(durations), sum(durations),
         )
-
-    successful = all(
-        result["success"]
-        for result in results
-    )
-
-    all_completed = len(results) == len(selected_jobs)
-
-    logger.info(
-        "ETL completados: %s/%s",
-        len(results),
-        len(selected_jobs),
-    )
-
-    logger.info(
-        "Duración total: %.2f segundos",
-        total_duration,
-    )
-
-    if successful and all_completed:
-        if args.only:
-            logger.info(
-                "ETL SILVER INDIVIDUAL COMPLETADO: %s.",
-                JOBS[args.only].name,
-            )
-        else:
-            logger.info(
-                "PIPELINE SILVER COMPLETADO CORRECTAMENTE: "
-                "las seis etapas finalizaron sin errores."
-            )
         return 0
-
-    logger.error(
-        "PIPELINE SILVER FINALIZADO CON ERRORES."
-    )
-
-    return 1
+    except Exception as exc:
+        logger.exception("PIPELINE SILVER DETENIDO: %s", exc)
+        return 1
 
 
 if __name__ == "__main__":

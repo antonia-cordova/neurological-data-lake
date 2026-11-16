@@ -13,17 +13,12 @@ from typing import Any
 import psycopg
 from psycopg import sql
 from dotenv import load_dotenv
+from scripts.database_config import database_for_scenario
 
 ROOT = Path(__file__).resolve().parents[2]
 GT_DIR = ROOT / "quality" / "ground_truth"
 REPORT_DIR = ROOT / "quality" / "reports"
 
-SOURCE_DB = "health_datalake"
-
-TARGETS = {
-    "medium": "health_datalake_medium",
-    "poor": "health_datalake_poor",
-}
 
 REQUIRED = {
     "database", "level", "schema", "table", "primary_key",
@@ -86,8 +81,10 @@ def norm(value: Any) -> str | None:
     return None if value is None else str(value)
 
 
-def load_gt(level: str) -> list[dict[str, Any]]:
-    path = GT_DIR / f"ground_truth_{level}.jsonl"
+def load_gt(level: str, test_mode: bool = False) -> list[dict[str, Any]]:
+    suffix = "_test" if test_mode else ""
+    target_db = database_for_scenario(level, test_mode)
+    path = GT_DIR / f"ground_truth_{level}{suffix}.jsonl"
 
     records = []
 
@@ -109,7 +106,7 @@ def load_gt(level: str) -> list[dict[str, Any]]:
 
             if (
                 record["level"] != level
-                or record["database"] != TARGETS[level]
+                or record["database"] != target_db
             ):
                 raise ValueError(
                     f"{path.name}, línea {line_no}: "
@@ -217,9 +214,10 @@ def read_cell(
     return "FOUND", rows[0][0]
 
 
-def audit(level: str, records: list[dict[str, Any]]):
+def audit(level: str, records: list[dict[str, Any]], test_mode: bool = False):
 
-    target_db = TARGETS[level]
+    source_db = database_for_scenario("perfect", test_mode)
+    target_db = database_for_scenario(level, test_mode)
 
     results = []
     first_seen = {}
@@ -239,7 +237,7 @@ def audit(level: str, records: list[dict[str, Any]]):
         else:
             first_seen[cell] = record["_line"]
 
-    with connect(SOURCE_DB) as source, connect(target_db) as target:
+    with connect(source_db) as source, connect(target_db) as target:
 
         cache = {}
 
@@ -409,7 +407,7 @@ def main():
     parser = argparse.ArgumentParser(
         description=(
             "Valida Ground Truth contra Perfect "
-            "y las bases degradadas."
+            "y las bases degradadas del mismo entorno."
         )
     )
 
@@ -419,6 +417,11 @@ def main():
         default="all",
     )
 
+    parser.add_argument(
+        "--test-mode",
+        action="store_true",
+        help="Audita las bases *_test y el Ground Truth aislado de pruebas.",
+    )
     args = parser.parse_args()
 
     levels = (
@@ -433,8 +436,8 @@ def main():
 
     for level in levels:
 
-        records = load_gt(level)
-        results = audit(level, records)
+        records = load_gt(level, args.test_mode)
+        results = audit(level, records, args.test_mode)
 
         all_results.extend(results)
 
@@ -449,7 +452,7 @@ def main():
         for status, count in sorted(counts.items()):
             print(f"{status:30} {count:>8,}")
 
-    report = REPORT_DIR / "ground_truth_validation.csv"
+    report = REPORT_DIR / ("ground_truth_validation_test.csv" if args.test_mode else "ground_truth_validation.csv")
 
     fields = [
         "level",

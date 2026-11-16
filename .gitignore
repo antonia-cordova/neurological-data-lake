@@ -20,6 +20,8 @@ venv/
 htmlcov/
 
 # Raw and processed datasets
+data/landing/*
+!data/landing/.gitkeep
 data/source/*
 data/bronze/*
 data/silver/*

@@ -1,25 +1,31 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 import argparse
 import hashlib
 import json
 import logging
 import os
-import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-import requests
 from dotenv import load_dotenv
 from sqlalchemy import URL, create_engine, text
 from sqlalchemy.engine import Engine
+
+from scripts.bronze.parquet_io import (
+    dataset_path,
+    read_parquet_frame,
+    selected_frequency,
+    validate_dataset_manifest,
+)
 from scripts.silver.silver_budget import (
     enforce_silver_budget,
     lock_silver_budget,
 )
 
+from scripts.database_config import get_target_database
+
 ROOT = Path(__file__).resolve().parents[2]
-BRONZE_DIR = ROOT / "data" / "bronze" / "acs_2024_county"
-API_URL = "https://api.census.gov/data/2024/acs/acs5/profile"
+BRONZE_DIR = ROOT / "data" / "landing" / "acs_2024_county"
+LEGACY_BRONZE_DIR = ROOT / "data" / "bronze" / "acs_2024_county"
 DATASET_NAME = "acs_2024_county_dp05"
 TARGET_TABLE = "silver_acs_county_2024"
 VARIABLES = {
@@ -42,7 +48,7 @@ log = logging.getLogger("etl_acs_county")
 def db_engine() -> Engine:
     load_dotenv(ROOT / ".env", override=False)
 
-    allowed_database = "health_datalake"
+    allowed_database = get_target_database()
     allowed_host = "localhost"
     allowed_port = 5432
 
@@ -220,39 +226,8 @@ def target_geographies(engine: Engine) -> dict[str, dict[str, str]]:
     return result
 
 
-def fetch(api_key: str) -> tuple[list[dict[str, str]], dict[str, Any]]:
-    params = {"get": ",".join(FIELDS), "for":"county:*", "in":"state:*", "key":api_key}
-    response = None
-    for attempt in range(1, 5):
-        try:
-            response = requests.get(API_URL, params=params, timeout=60)
-            response.raise_for_status()
-            break
-        except requests.RequestException as exc:
-            if attempt == 4:
-                raise RuntimeError(f"Error Census API: {exc}") from exc
-            delay = min(2 ** attempt, 30)
-            log.warning("Fallo API, reintento %s/4 en %ss", attempt, delay)
-            time.sleep(delay)
-    payload = response.json()
-    if not isinstance(payload, list) or len(payload) < 2:
-        raise ValueError(f"Respuesta Census API inesperada: {str(payload)[:500]}")
-    headers = payload[0]
-    required = set(FIELDS + ["state", "county"])
-    absent = required - set(headers)
-    if absent:
-        raise ValueError(f"La API no devolviÃ³ campos requeridos: {sorted(absent)}")
-    rows = [dict(zip(headers, values, strict=True)) for values in payload[1:]]
-    metadata = {"api_url":API_URL,"dataset":"2024 ACS 5-Year Data Profiles",
-        "profile":"DP05","geography":"county:* within state:*",
-        "requested_variables":VARIABLES,"requested_fields":FIELDS,
-        "api_rows_excluding_header":len(rows),"http_status":response.status_code,
-        "retrieved_at_utc":datetime.now(timezone.utc).isoformat(),"api_key_persisted":False}
-    return rows, metadata
-
-
 def read_bronze(path: Path) -> tuple[list[dict[str, str]], dict[str, Any], str]:
-    """Lee Bronze y verifica su integridad mediante el manifiesto SHA-256."""
+    """Lee el JSON original de Landing y verifica su manifiesto SHA-256."""
     path = path.resolve()
 
     if not path.is_file():
@@ -331,9 +306,55 @@ def read_bronze(path: Path) -> tuple[list[dict[str, str]], dict[str, Any], str]:
     return rows, metadata, checksum
 
 
+
+def read_simulated_parquet(frequency: str) -> tuple[list[dict[str, str]], dict[str, Any], str]:
+    """Lee los registros ACS County simulados desde Parquet y valida el manifiesto."""
+    dataset_manifest = validate_dataset_manifest("acs_2024_county_dp05")
+    parquet_dir = dataset_path("acs_2024_county_dp05")
+    manifest_path = (
+        ROOT / "data" / "bronze" / frequency / "metadata" / "bronze_manifest.json"
+    )
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"No existe el manifiesto de Bronze Simulator: {manifest_path}"
+        )
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("frequency") != frequency:
+        raise ValueError("La frecuencia del manifiesto Bronze no coincide con la seleccionada.")
+
+    manifest_dataset = manifest.get("datasets", {}).get("acs_2024_county_dp05")
+    if not isinstance(manifest_dataset, dict) or manifest_dataset != dataset_manifest:
+        raise ValueError("El manifiesto ACS County no coincide con el manifiesto validado.")
+
+    columns = FIELDS + ["state", "county"]
+    table = read_parquet_frame(parquet_dir, columns=columns)
+    expected_rows = int(dataset_manifest.get("source_rows", -1))
+    if table.num_rows != expected_rows:
+        raise ValueError(
+            f"ACS County Parquet contiene {table.num_rows} filas; "
+            f"el manifiesto declara {expected_rows}."
+        )
+
+    rows = table.to_pylist()
+    metadata = {
+        "dataset": "2024 ACS 5-Year Data Profiles",
+        "profile": "DP05",
+        "source": "bronze_simulator_parquet",
+        "frequency": frequency,
+        "source_file": dataset_manifest.get("source_file"),
+        "source_file_sha256": dataset_manifest.get("source_file_sha256"),
+        "manifest_file": str(manifest_path),
+    }
+    checksum = str(dataset_manifest.get("source_file_sha256") or "")
+    if not checksum:
+        raise ValueError("El manifiesto ACS County no contiene SHA-256 de la fuente.")
+    return rows, metadata, checksum
+
+
 def discover_bronze() -> Path | None:
     """
-    Busca archivos Bronze válidos en BRONZE_DIR.
+    Busca archivos JSON originales válidos en Landing.
 
     Selecciona automáticamente solo cuando existe exactamente uno.
     Si hay varios, exige selección explícita mediante --bronze.
@@ -346,9 +367,14 @@ def discover_bronze() -> Path | None:
         path for path in BRONZE_DIR.glob("*.json")
         if not path.name.endswith(".manifest.json")
     )
+    if not candidates:
+        candidates = sorted(
+            path for path in LEGACY_BRONZE_DIR.glob("*.json")
+            if not path.name.endswith(".manifest.json")
+        )
 
     if not candidates:
-        log.info("No hay archivos Bronze disponibles en %s", BRONZE_DIR)
+        log.info("No hay JSON ACS County en Landing ni en Bronze heredado.")
         return None
 
     valid_files = []
@@ -388,21 +414,6 @@ def discover_bronze() -> Path | None:
     )
 
     return selected
-
-
-def save_bronze(rows: list[dict[str,str]], metadata: dict[str,Any], run_id: int) -> str:
-    BRONZE_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    stem = f"acs_dp05_county_run_{run_id}_{stamp}"
-    raw = json.dumps({"headers": FIELDS + ["state", "county"], "data": rows},
-                     ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    digest = hashlib.sha256(raw).hexdigest()
-    (BRONZE_DIR / f"{stem}.json").write_bytes(raw)
-    manifest = {**metadata,"run_id":run_id,"raw_file":f"{stem}.json",
-                "sha256":digest,"raw_file_bytes":len(raw),"software":"etl_acs_county.py"}
-    (BRONZE_DIR / f"{stem}.manifest.json").write_text(
-        json.dumps(manifest,ensure_ascii=False,indent=2),encoding="utf-8")
-    return digest
 
 
 def clean_stat_value(value: Any) -> str | None:
@@ -655,19 +666,19 @@ def calculate_budget(conn) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="ETL ACS 2024 5-Year DP05 para condados del proyecto"
+        description="ETL ACS County desde Parquet Bronze o JSON original de Landing"
     )
 
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Descarga y valida, sin cargar Silver",
+        help="Valida la fuente y normaliza sin cargar Silver",
     )
 
     parser.add_argument(
         "--bronze",
         type=Path,
-        help="Lee un archivo JSON Bronze existente",
+        help="Lee un archivo JSON original de Landing (diagnóstico heredado)",
     )
 
     parser.add_argument(
@@ -686,51 +697,31 @@ def main() -> int:
         run_id = start_run(engine)
         geos = target_geographies(engine)
 
-        # Selección de la fuente Bronze.
+        # Selección de fuente: el flujo maestro consume Parquet simulado.
+        # La lectura JSON de Landing se mantiene para diagnóstico heredado.
+        frequency = selected_frequency()
         if args.bronze:
-            # El usuario selecciona expresamente el archivo.
             api_rows, metadata, checksum = read_bronze(args.bronze)
-
+            log.info("Reconstrucción desde JSON explícito de Landing: %s", args.bronze)
+        elif frequency is not None:
+            api_rows, metadata, checksum = read_simulated_parquet(frequency)
             log.info(
-                "Reconstrucción desde Bronze explícito: %s",
-                args.bronze,
+                "Reconstrucción desde Bronze Parquet: dataset=acs_2024_county_dp05, "
+                "frecuencia=%s",
+                frequency,
             )
-
         else:
-            # Buscar automáticamente una única versión Bronze válida.
             selected_bronze = discover_bronze()
-
-            if selected_bronze is not None:
-                api_rows, metadata, checksum = read_bronze(
-                    selected_bronze
+            if selected_bronze is None:
+                raise FileNotFoundError(
+                    "No existe JSON ACS County en Landing. "
+                    "Ejecuta primero scripts.landing.prepare_landing."
                 )
-
-                log.info(
-                    "Reconstrucción desde Bronze automático: %s",
-                    selected_bronze.name,
-                )
-
-            else:
-                # Si no existe Bronze válido, utilizar Census API.
-                api_key = os.getenv("CENSUS_API_KEY")
-
-                if not api_key:
-                    raise RuntimeError(
-                        "No existe un archivo Bronze válido en "
-                        f"{BRONZE_DIR} y tampoco está configurada "
-                        "CENSUS_API_KEY. Descarga el Bronze o configura la API."
-                    )
-
-                log.info(
-                    "No hay Bronze válido. Se utilizará Census API."
-                )
-
-                api_rows, metadata = fetch(api_key)
-                checksum = save_bronze(
-                    api_rows,
-                    metadata,
-                    run_id,
-                )
+            api_rows, metadata, checksum = read_bronze(selected_bronze)
+            log.info(
+                "Reconstrucción desde JSON de Landing: %s",
+                selected_bronze.name,
+            )
 
         # Normalización y validaciones.
         source_rows = len(api_rows)

@@ -1,6 +1,4 @@
 {
-  "database": "health_datalake_poor",
-  "source_database": "health_datalake",
   "seed": 20261109,
   "rates": {
     "accuracy": 0.25,
@@ -22,5 +20,7 @@
     "preserve_etl_runs": true,
     "generate_ground_truth": true,
     "generate_csv_report": true
-  }
+  },
+  "scenario": "poor",
+  "frequency": "every_6_days"
 }

@@ -19,7 +19,11 @@ RESPONSE_TABLE = "silver_brfss_2023"
 SOURCE_RUN_TARGET_TABLE = "silver_respondent+silver_brfss_2023"
 DATASET_NAME = "brfss_2023"
 CODEBOOK_PATH = (
-    ROOT / "data" / "bronze" / "brfss_2023" / "USCODE23_LLCP_021924.HTML"
+    ROOT
+    / "data"
+    / "landing"
+    / "brfss_2023"
+    / "USCODE23_LLCP_021924.HTML"
 )
 
 EXPECTED_RESPONDENTS = 2800

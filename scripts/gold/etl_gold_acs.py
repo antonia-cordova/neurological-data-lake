@@ -8,6 +8,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from scripts.gold.db_connection import create_gold_engine
+from scripts.database_config import get_target_database
 from scripts.gold.silver_run_validator import resolve_single_silver_run_id
 from sqlalchemy import text
 
@@ -25,7 +26,7 @@ INSERT_BATCH_SIZE = 100
 
 # Debe coincidir con el bloqueo global de scripts/run_gold_pipeline.py.
 GOLD_PIPELINE_LOCK_KEY = 78_115_004_452_421
-DATABASE_ALLOWED = "health_datalake"
+DATABASE_ALLOWED = get_target_database()
 
 INDENT_CHARS = " \t\u00a0"
 

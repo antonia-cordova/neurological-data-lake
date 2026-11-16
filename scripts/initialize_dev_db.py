@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import os
 from pathlib import Path
 
@@ -8,14 +9,13 @@ from psycopg import sql
 from dotenv import load_dotenv
 
 
+from scripts.database_config import SCENARIOS, database_for_scenario, get_target_database
+from scripts.bronze.parquet_io import validate_dataset_manifest
+
 ROOT = Path(__file__).resolve().parents[1]
 
-# Guardas deliberadamente fijas: este inicializador no debe operar
-# sobre la base de reproducción ni sobre las bases degradadas.
-ALLOWED_DATABASE = "health_datalake"
 ALLOWED_HOST = "localhost"
 ALLOWED_PORT = 5432
-BACKUP_FILE = ROOT / "backups" / "health_datalake_backup.dump"
 
 # Fuentes únicas para la creación de estructuras.
 SCHEMA_FILES = [
@@ -62,49 +62,51 @@ EXPECTED_TABLES = {
 EXPECTED_TABLE_COUNT = 27
 
 
-def get_connection():
-    load_dotenv(ROOT / ".env")
-
-    host = os.getenv("POSTGRES_HOST", "localhost")
-    port = int(os.getenv("POSTGRES_PORT", "5432"))
-    database = os.getenv("POSTGRES_DB", "")
-
-    if host != ALLOWED_HOST or port != ALLOWED_PORT:
-        raise RuntimeError(
-            f"Destino rechazado: solo se permite {ALLOWED_HOST}:{ALLOWED_PORT}; "
-            f"se recibió {host}:{port}."
-        )
-
-    if database != ALLOWED_DATABASE:
-        raise RuntimeError(
-            f"Base rechazada: solo se permite {ALLOWED_DATABASE}; "
-            f"POSTGRES_DB={database!r}."
-        )
-
+def get_admin_connection():
+    load_dotenv(ROOT / ".env", override=False)
     required = ["POSTGRES_USER", "POSTGRES_PASSWORD"]
     missing = [key for key in required if not os.getenv(key)]
     if missing:
         raise RuntimeError(f"Faltan variables en .env: {', '.join(missing)}")
-
-    conn = psycopg.connect(
-        host=host,
-        port=port,
-        dbname=database,
+    host = os.getenv("POSTGRES_HOST", "localhost")
+    port = int(os.getenv("POSTGRES_PORT", "5432"))
+    if host != ALLOWED_HOST or port != ALLOWED_PORT:
+        raise RuntimeError(
+            f"Destino rechazado: solo {ALLOWED_HOST}:{ALLOWED_PORT}; "
+            f"se recibió {host}:{port}."
+        )
+    return psycopg.connect(
+        host=host, port=port, dbname="postgres",
         user=os.environ["POSTGRES_USER"],
         password=os.environ["POSTGRES_PASSWORD"],
-        connect_timeout=5,
+        connect_timeout=5, autocommit=True,
     )
 
-    with conn.cursor() as cur:
-        cur.execute("SELECT current_database(), current_user")
-        actual_database, actual_user = cur.fetchone()
 
-    if actual_database != ALLOWED_DATABASE:
-        conn.close()
-        raise RuntimeError(f"Conexión rechazada: base efectiva {actual_database!r}.")
+def get_connection():
+    load_dotenv(ROOT / ".env", override=False)
+    database = get_target_database()
+    return psycopg.connect(
+        host=ALLOWED_HOST, port=ALLOWED_PORT, dbname=database,
+        user=os.environ["POSTGRES_USER"],
+        password=os.environ["POSTGRES_PASSWORD"], connect_timeout=5,
+    )
 
-    print(f"Usuario PostgreSQL: {actual_user}")
-    return conn
+
+def ensure_database_exists(database: str) -> None:
+    with get_admin_connection() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM pg_database WHERE datname = %s", (database,)
+        ).fetchone()
+        if exists:
+            raise RuntimeError(
+                f"La base {database} ya existe. El inicializador no la "
+                "sobrescribe, reinicia ni reutiliza."
+            )
+        conn.execute(
+            sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database))
+        )
+        print(f"[CREATE DATABASE] {database}")
 
 
 def get_existing_tables(conn) -> set[tuple[str, str]]:
@@ -121,25 +123,99 @@ def get_existing_tables(conn) -> set[tuple[str, str]]:
         return {(row[0], row[1]) for row in cur.fetchall()}
 
 
-def validate_backup() -> None:
-    if not BACKUP_FILE.is_file():
+def create_scenario_metadata(conn, scenario: str, frequency: str, quality_level: str) -> None:
+    scenario_root = ROOT / "data" / "bronze" / frequency
+    manifest_path = scenario_root / "metadata" / "bronze_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"No existe el manifiesto Bronze del escenario: {manifest_path}")
+    import json
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("contract_version") != 1 or manifest.get("frequency") != frequency:
+        raise RuntimeError("El manifiesto Bronze no corresponde al escenario solicitado.")
+    expected_frequency = SCENARIOS[scenario]["frequency"]
+    expected_step_days = {"daily": 1, "every_3_days": 3, "every_6_days": 6}[expected_frequency]
+    expected_days = {"daily": 731, "every_3_days": 244, "every_6_days": 122}[expected_frequency]
+    if manifest.get("calendar_start") != "2023-01-01" or manifest.get("calendar_end") != "2024-12-31":
+        raise RuntimeError("El calendario Bronze no cubre el período contractual 2023-01-01 a 2024-12-31.")
+    if int(manifest.get("calendar_step_days", -1)) != expected_step_days:
+        raise RuntimeError("El paso de días del calendario Bronze no corresponde a la frecuencia.")
+    if int(manifest.get("calendar_dates", -1)) != expected_days:
         raise RuntimeError(
-            "No se encontró el respaldo requerido: "
-            f"{BACKUP_FILE}. No se reiniciará una base existente."
+            f"Calendario Bronze incorrecto para {scenario}: "
+            f"{manifest.get('calendar_dates')} fechas; se esperaban {expected_days}."
         )
 
-    size = BACKUP_FILE.stat().st_size
-    if size <= 0:
-        raise RuntimeError(f"El respaldo está vacío: {BACKUP_FILE}")
+    datasets = manifest.get("datasets")
+    if not isinstance(datasets, dict) or not datasets:
+        raise RuntimeError("El manifiesto Bronze no contiene datasets.")
+    batch_rows = []
+    for dataset_name, entry in datasets.items():
+        validate_dataset_manifest(dataset_name)
+        files = entry.get("parquet_files", [])
+        if sum(int(item["rows"]) for item in files) != int(entry["source_rows"]):
+            raise RuntimeError(f"Conteo de lotes no coincide para {dataset_name}.")
+        for item in files:
+            batch_date = item.get("simulated_received_date")
+            if not batch_date:
+                raise RuntimeError(
+                    f"Falta simulated_received_date en {dataset_name}/{item.get('path')}."
+                )
+            batch_rows.append((
+                dataset_name,
+                frequency,
+                batch_date,
+                item["path"],
+                int(item["rows"]),
+                int(item["bytes"]),
+                item["sha256"],
+            ))
 
-    print(
-        f"[OK] Respaldo local encontrado: {BACKUP_FILE.relative_to(ROOT)} "
-        f"({size:,} bytes)."
+    conn.execute("CREATE SCHEMA IF NOT EXISTS datalake_control")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS datalake_control.scenario_metadata (
+            singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+            scenario TEXT NOT NULL CHECK (scenario IN ('perfect','medium','poor')),
+            frequency TEXT NOT NULL CHECK (frequency IN ('daily','every_3_days','every_6_days')),
+            quality_level TEXT NOT NULL CHECK (quality_level IN ('perfect','medium','poor')),
+            quality_status TEXT NOT NULL CHECK (quality_status IN ('pristine','degraded')),
+            calendar_start DATE NOT NULL,
+            calendar_end DATE NOT NULL,
+            calendar_step_days INTEGER NOT NULL CHECK (calendar_step_days IN (1,3,6)),
+            calendar_dates INTEGER NOT NULL CHECK (calendar_dates > 0),
+            initialized_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+            degraded_at TIMESTAMPTZ NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS datalake_control.ingestion_batches (
+            batch_key BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            dataset_name TEXT NOT NULL,
+            frequency TEXT NOT NULL CHECK (frequency IN ('daily','every_3_days','every_6_days')),
+            simulated_received_date DATE NOT NULL,
+            parquet_path TEXT NOT NULL UNIQUE,
+            record_count INTEGER NOT NULL CHECK (record_count > 0),
+            file_bytes BIGINT NOT NULL CHECK (file_bytes > 0),
+            sha256 CHAR(64) NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$')
+        )
+    """)
+    conn.execute(
+        "INSERT INTO datalake_control.scenario_metadata "
+        "(singleton, scenario, frequency, quality_level, quality_status, "
+        "calendar_start, calendar_end, calendar_step_days, calendar_dates) "
+        "VALUES (TRUE, %s, %s, %s, 'pristine', %s, %s, %s, %s)",
+        (
+            scenario, frequency, quality_level,
+            manifest["calendar_start"], manifest["calendar_end"],
+            int(manifest["calendar_step_days"]), int(manifest["calendar_dates"]),
+        ),
     )
-    print(
-        "[INFO] Se asume que el archivo fue validado con pg_restore --list "
-        "antes de ejecutar el inicializador."
-    )
+    with conn.cursor() as cur:
+        cur.executemany(
+            "INSERT INTO datalake_control.ingestion_batches "
+            "(dataset_name, frequency, simulated_received_date, parquet_path, "
+            "record_count, file_bytes, sha256) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            batch_rows,
+        )
 
 
 def read_schema(path: Path) -> str:
@@ -185,69 +261,50 @@ def validate_tables(conn) -> None:
 
 
 def main() -> int:
-    print(f"Destino autorizado: {ALLOWED_DATABASE}")
-    print(f"Servidor autorizado: {ALLOWED_HOST}:{ALLOWED_PORT}")
+    parser = argparse.ArgumentParser(
+        description="Crea e estructura una de las tres bases del neurological-data-lake."
+    )
+    parser.add_argument("--scenario", choices=tuple(SCENARIOS), required=True)
+    parser.add_argument("--test-mode", action="store_true")
+    args = parser.parse_args()
 
-    # Leer y comprobar los dos archivos antes de tocar la base.
+    os.environ["DATALAKE_SCENARIO"] = args.scenario
+    os.environ["DATALAKE_TEST_MODE"] = "1" if args.test_mode else "0"
+    spec = SCENARIOS[args.scenario]
+    os.environ["POSTGRES_DB"] = database_for_scenario(args.scenario, args.test_mode)
+    os.environ["BRONZE_INGESTION_FREQUENCY"] = spec["frequency"]
+    database = get_target_database()
+
     schemas = [(path, read_schema(path)) for path in SCHEMA_FILES]
-
+    ensure_database_exists(database)
     conn = get_connection()
     try:
         existing_tables = get_existing_tables(conn)
-
+        unexpected = sorted(existing_tables - EXPECTED_TABLES)
+        if unexpected:
+            raise RuntimeError(
+                f"La base {database} contiene tablas inesperadas: {unexpected}."
+            )
         if existing_tables:
-            unexpected = sorted(existing_tables - EXPECTED_TABLES)
-            if unexpected:
-                raise RuntimeError(
-                    "Reinicio cancelado: existen tablas fuera del inventario "
-                    "esperado. No se eliminó ni modificó ningún objeto.\n"
-                    f"Tablas inesperadas: {unexpected}"
-                )
-
-            validate_backup()
-            print(f"Base objetivo: {ALLOWED_DATABASE}")
-            print(f"Tablas existentes que se reconstruirán: {len(existing_tables)}")
-
-            confirmation = input(
-                "Para confirmar, escribe exactamente "
-                "'RESET health_datalake': "
-            ).strip()
-
-            if confirmation != "RESET health_datalake":
-                raise RuntimeError(
-                    "Reinicio cancelado por el usuario. No se modificó la base."
-                )
-        else:
-            print("[INFO] No hay tablas previas en public/gold.")
-
-        # Cerrar la transacción implícita abierta por la consulta de
-        # inspección. Así conn.transaction() abre una transacción real
-        # (no un savepoint anidado) y confirma el bloque completo al salir.
+            raise RuntimeError(
+                f"La base {database} ya contiene tablas. No se sobrescribirá."
+            )
+        # Las consultas de inspección abrieron una transacción implícita.
+        # Se confirma antes de iniciar la transacción atómica de los esquemas.
         conn.commit()
-
-        # Operación atómica: DROP + creación Silver + creación Gold +
-        # validación se confirman juntas. Si cualquier paso falla,
-        # PostgreSQL revierte la transacción y conserva el estado previo.
         with conn.transaction():
             with conn.cursor() as cur:
-                for schema_name, table_name in sorted(existing_tables, reverse=True):
-                    cur.execute(
-                        sql.SQL("DROP TABLE {}.{} CASCADE").format(
-                            sql.Identifier(schema_name),
-                            sql.Identifier(table_name),
-                        )
-                    )
-                    print(f"[DROP] {schema_name}.{table_name}")
-
                 for path, schema_text in schemas:
                     print(f"[APPLY] {path.relative_to(ROOT)}")
                     cur.execute(schema_text)
                     print(f"[OK] {path.name}")
-
+            create_scenario_metadata(
+                conn, args.scenario, spec["frequency"], spec["quality_level"]
+            )
             validate_tables(conn)
-
         print(
-            f"\nInicialización finalizada correctamente en {ALLOWED_DATABASE}."
+            f"Inicialización completada: {database} | "
+            f"frecuencia={spec['frequency']} | calidad={spec['quality_level']}"
         )
         return 0
     finally:
