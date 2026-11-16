@@ -29,7 +29,7 @@ def lock_silver_budget(conn: Connection) -> None:
 def calculate_silver_cells(conn: Connection) -> int:
     found = conn.execute(text("""
         SELECT table_name FROM information_schema.tables
-        WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+        WHERE table_schema = 'silver' AND table_type = 'BASE TABLE'
           AND table_name LIKE 'silver_%'
     """)).scalars().all()
     unexpected = set(found) - EXPECTED_SILVER_TABLES
@@ -39,17 +39,17 @@ def calculate_silver_cells(conn: Connection) -> int:
     if missing:
         raise RuntimeError("Faltan tablas Silver requeridas: " + ", ".join(sorted(missing)))
 
-    places = int(conn.execute(text("SELECT COUNT(*) * 9 FROM public.silver_places_2023")).scalar_one())
+    places = int(conn.execute(text("SELECT COUNT(*) * 9 FROM silver.silver_places_2023")).scalar_one())
     # BRFSS contabiliza exclusivamente las variables analíticas del JSONB.
     # silver_respondent contiene metadatos técnicos y no suma celdas al presupuesto.
     brfss = int(conn.execute(text("""
         SELECT COUNT(*)
-        FROM public.silver_brfss_2023 response
+        FROM silver.silver_brfss_2023 response
         CROSS JOIN LATERAL jsonb_object_keys(response.record_data) AS variable(key)
     """)).scalar_one())
-    acs_national = int(conn.execute(text("SELECT COUNT(*) * 7 FROM public.silver_acs_2024")).scalar_one())
+    acs_national = int(conn.execute(text("SELECT COUNT(*) * 7 FROM silver.silver_acs_2024")).scalar_one())
     # Diez campos lógicos por fila; se excluye la PK identity.
-    acs_county = int(conn.execute(text("SELECT COUNT(*) * 10 FROM public.silver_acs_county_2024")).scalar_one())
+    acs_county = int(conn.execute(text("SELECT COUNT(*) * 10 FROM silver.silver_acs_county_2024")).scalar_one())
     return places + brfss + acs_national + acs_county
 
 

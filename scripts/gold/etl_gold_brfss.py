@@ -8,7 +8,7 @@ from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
 from pathlib import Path
 
-from scripts.gold.db_connection import create_gold_engine
+from scripts.database_connection import create_database_engine
 from scripts.gold.silver_run_validator import resolve_single_silver_run_id
 from sqlalchemy import bindparam, text
 
@@ -294,7 +294,7 @@ def validate_source_run(conn, source_run_id: int) -> dict:
                 loaded_rows,
                 status,
                 finished_at
-            FROM public.etl_runs
+            FROM datalake_control.etl_runs
             WHERE run_id = :run_id
         """),
         {"run_id": source_run_id},
@@ -387,10 +387,10 @@ def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
 
     # Evitar que la capa Silver cambie mientras Gold valida y consume.
     conn.execute(text("""
-        LOCK TABLE public.silver_respondent IN SHARE MODE
+        LOCK TABLE silver.silver_respondent IN SHARE MODE
     """))
     conn.execute(text("""
-        LOCK TABLE public.silver_brfss_2023 IN SHARE MODE
+        LOCK TABLE silver.silver_brfss_2023 IN SHARE MODE
     """))
 
     lineage = conn.execute(
@@ -402,8 +402,8 @@ def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
                 COUNT(DISTINCT respondent.run_id) AS distinct_runs,
                 MIN(respondent.run_id) AS min_run_id,
                 MAX(respondent.run_id) AS max_run_id
-            FROM public.silver_respondent respondent
-            LEFT JOIN public.silver_brfss_2023 response
+            FROM silver.silver_respondent respondent
+            LEFT JOIN silver.silver_brfss_2023 response
                 ON response.respondent_id = respondent.respondent_id
             WHERE respondent.run_id = :run_id
         """),
@@ -429,8 +429,8 @@ def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
                 respondent.state_fips AS state_code,
                 respondent.sequence_number,
                 response.record_data
-            FROM public.silver_respondent respondent
-            INNER JOIN public.silver_brfss_2023 response
+            FROM silver.silver_respondent respondent
+            INNER JOIN silver.silver_brfss_2023 response
                 ON response.respondent_id = respondent.respondent_id
             WHERE respondent.run_id = :run_id
             ORDER BY respondent.state_fips, respondent.sequence_number
@@ -1062,7 +1062,7 @@ def load_facts(
 
 
 def run_etl(source_run_id: int | None = None):
-    engine = create_gold_engine()
+    engine = create_database_engine()
 
     try:
         with engine.begin() as conn:

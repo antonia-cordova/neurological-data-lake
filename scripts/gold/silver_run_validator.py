@@ -18,7 +18,7 @@ def resolve_single_silver_run_id(
     """
 
     if not re.fullmatch(
-        r"(?:public\.)?[a-zA-Z_][a-zA-Z0-9_]*",
+    r"(?:silver\.)?[a-zA-Z_][a-zA-Z0-9_]*",
         table_name,
     ):
         raise ValueError(f"Nombre de tabla no permitido: {table_name!r}")
@@ -26,7 +26,7 @@ def resolve_single_silver_run_id(
     qualified_table = (
         table_name
         if "." in table_name
-        else f"public.{table_name}"
+        else f"silver.{table_name}"
     )
 
     expected_table = target_table or qualified_table.split(".")[-1]
@@ -50,7 +50,7 @@ def resolve_single_silver_run_id(
                     dataset_name,
                     target_table,
                     loaded_rows
-                FROM public.etl_runs
+                FROM datalake_control.etl_runs
                 WHERE dataset_name = :dataset_name
                   AND target_table = :target_table
                   AND status = 'succeeded'
@@ -82,7 +82,7 @@ def resolve_single_silver_run_id(
                     loaded_rows,
                     status,
                     finished_at
-                FROM public.etl_runs
+                FROM datalake_control.etl_runs
                 WHERE run_id = :run_id
             """),
             {"run_id": requested_run_id},

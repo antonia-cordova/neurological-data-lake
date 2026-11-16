@@ -1,12 +1,10 @@
 # Neurological Data Lake
 
-Neurological Data Lake es una arquitectura de datos orientada a la integración, transformación y análisis de información sanitaria y demográfica de Estados Unidos.
-
-El proyecto implementa una arquitectura de Data Lake con tres capas: Bronze, Silver y Gold. A partir de la base de datos original se generan, además, dos copias experimentales con distintos niveles de degradación intencional de calidad: Medium y Poor.
+El presente proyecto implementa una arquitectura de tres capas: **Bronze, Silver y Gold**. A partir de una misma fuente de datos se construyen tres versiones independientes: una versión original (perfect) y dos versiones con distintos niveles de degradación controlada (medium y poor).
 
 ---
 
-## 2. Fuentes de datos
+## 1. Fuentes de datos
 
 | Fuente | Descripción |
 |---|---|
@@ -15,30 +13,44 @@ El proyecto implementa una arquitectura de Data Lake con tres capas: Bronze, Sil
 | BRFSS 2023 | Behavioral Risk Factor Surveillance System. |
 | PLACES 2025 | Local Data for Better Health, publicación 2025, con observaciones correspondientes a 2023. |
 
-La muestra BRFSS utilizada contiene 2.800 personas y 20 variables seleccionadas mediante un procedimiento determinista estratificado.
+---
 
-## 3. Arquitectura
-
-El proyecto utiliza una arquitectura Medallion con las siguientes capas:
+## 2. Capas
 
 | Capa | Descripción |
 |---|---|
-| Bronze | Almacenamiento de los datos originales descargados desde las fuentes oficiales. |
+| Landing | Recepción y organización de los archivos de origen. |
+| Bronze | Generación y almacenamiento de archivos Parquet con metadatos de ingesta simulada. |
 | Silver | Datos transformados, estructurados, tipados y preparados para análisis. |
 | Gold | Modelo dimensional, tablas de hechos, dimensiones, integración geográfica y consolidación analítica. |
-| Platinum | Capa contemplada para una futura implementación de productos analíticos avanzados. |
 
-A partir de la base original Gold se generan dos bases de datos adicionales:
+### 2.1. Versiones de calidad
 
-| Base de datos | Descripción |
-|---|---|
-| `health_datalake` | Base original, sin degradación intencional. |
-| `health_datalake_medium` | Copia con degradación controlada de calidad de nivel medio. |
-| `health_datalake_poor` | Copia con degradación controlada de calidad de nivel alto. |
+El proyecto utiliza tres bases de datos PostgreSQL independientes:
 
-Las bases Medium y Poor se generan independientemente desde la base original. **No se aplica una degradación sucesiva de Medium hacia Poor.**
+| Escenario | Base de datos | Descripción |
+|---|---|---|
+| Perfect | `health_datalake` | Escenario de referencia, sin degradación intencional. |
+| Medium | `health_datalake_medium` | Escenario con degradación controlada. |
+| Poor | `health_datalake_poor` | Escenario con mayor degradación controlada. |
 
-## 4. Tecnologías
+Medium y Poor se generan independientemente a partir del escenario original.
+
+
+### 2.2. Organización de esquemas en PostgreSQL
+
+Cada base de datos organiza sus tablas en tres esquemas:
+
+| Esquema | Responsabilidad | Tablas |
+|---|---|---:|
+| `silver` | Datos depurados, normalizados y estructurados. | 9 |
+| `gold` | Modelo dimensional y productos analíticos. | 17 |
+| `datalake_control` | Control de ejecuciones, lotes de ingesta y metadatos del escenario. | 3 |
+| **Total** | | **29** |
+
+---
+
+## 3. Tecnologías
 
 - Python 3.12.
 - PostgreSQL 17.
@@ -52,17 +64,20 @@ Las bases Medium y Poor se generan independientemente desde la base original. **
 - PyYAML.
 - python-dotenv.
 
-## 5. Requisitos
+---
+
+## 4. Requisitos
 
 - Git.
 - Python 3.12.x.
 - Docker Desktop o Docker Engine.
 - Docker Compose v2.
 
+---
 
-## 6. Instalación y configuración
+## 5. Instalación y configuración
 
-### 6.1. Clonar el repositorio
+### 5.1. Clonar el repositorio
 
 ```bash
 git clone -b develop https://github.com/antonia-cordova/neurological-data-lake.git
@@ -70,24 +85,15 @@ git clone -b develop https://github.com/antonia-cordova/neurological-data-lake.g
 cd neurological-data-lake
 ```
 
-### 6.2. Incorporar los datos Bronze
+### 5.2. Incorporar los datos de origen
 
-Los archivos correspondientes a la capa bronze se comparten en un archivo .zip y no se incluyen directamente en GitHub.
+Los archivos de datos originales se encuentran en una carpeta en Google Drive y no se incluyen directamente en GitHub.
 
-Descargar y extraer la carpeta en la siguiente ubicacion:
+Se deben descargar, extraer y ubicar en la estructura esperada por el proyecto, respetando los nombres y las rutas configuradas para cada dataset.
 
-```text
-data/bronze/
-├── acs_2024/
-├── acs_2024_county/
-├── brfss_2023/
-└── places_2025/
-```
+La capa Bronze se genera a partir de los datos de entrada mediante el simulador de ingesta.
 
-
-### 6.3. Crear el entorno virtual
-
-Desde la raíz del repositorio:
+### 5.3. Crear el entorno virtual
 
 ```bash
 python3 -m venv .venv
@@ -95,7 +101,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-### 6.4. Instalar dependencias
+### 5.4. Instalar dependencias
 
 ```bash
 python -m pip install --upgrade pip
@@ -105,7 +111,7 @@ python -m pip install -r requirements-lock.txt
 python -m pip check
 ```
 
-### 6.5. Configurar variables de entorno
+### 5.5. Configurar variables de entorno
 
 Crear el archivo `.env` a partir del archivo de ejemplo:
 
@@ -113,92 +119,129 @@ Crear el archivo `.env` a partir del archivo de ejemplo:
 cp .env.example .env
 ```
 
-Editar el archivo:
+Editar el archivo `.env` y configurar las credenciales de PostgreSQL.
+
+La configuración debe coincidir con la utilizada por Docker Compose y los procesos Python.
+
+---
+
+## 6. Ingesta y generación de la capa Bronze
+
+La capa Bronze se genera mediante `scripts/bronze/bronze_simulator.py`.
+
+El simulador utiliza los cuatro datasets de entrada y genera archivos Parquet organizados según distintas frecuencias de ingesta:
+
+| Frecuencia | Número de fechas |
+|---|---:|
+| Daily | 731 |
+| Every 3 days | 244 |
+| Every 6 days | 122 |
+
+El calendario simulado comprende el período entre el 1 de enero de 2023 y el 31 de diciembre de 2024.
+
+La distribución de los registros entre fechas es determinista y no modifica los valores originales de los datos.
+
+### 6.1. Metadatos de ingesta
+
+Cada registro incorpora siete columnas técnicas:
+
+| Columna | Descripción |
+|---|---|
+| `source_record_id` | Identificador del registro de origen dentro del proceso de ingesta. |
+| `source_file` | Archivo del que procede el registro. |
+| `simulated_received_date` | Fecha simulada de recepción. |
+| `ingestion_sequence` | Secuencia de ingesta del registro. |
+| `ingestion_batch_id` | Identificador del lote de ingesta. |
+| `ingestion_scenario` | Escenario al que pertenece el lote. |
+| `source_row_hash` | Hash de la fila de origen para controles de integridad. |
+
+
+---
+
+## 6. Ejecución integral del Data Lake
+
+La ejecución se coordina mediante un único punto de entrada:
 
 ```bash
-nano .env
+python -m scripts.run_pipeline
 ```
 
-No olvidar ajustar la contraseña localmente.
+### 6.1. Secuencia de ejecución
 
-La configuración del archivo `.env` debe coincidir con la utilizada por Docker Compose y los procesos Python.
+El coordinador realiza las siguientes operaciones:
 
----
+1. Comprueba las variables de entorno y la disponibilidad de PostgreSQL.
+2. Inspecciona las bases de datos objetivo y sus metadatos.
+3. Ejecuta Landing una sola vez.
+4. Para cada base inexistente, genera la capa Bronze mediante el simulador.
+5. Inicializa la estructura PostgreSQL del escenario.
+6. Ejecuta el pipeline Silver.
+7. Ejecuta el pipeline Gold.
+8. Para los escenarios Medium y Poor, aplica la degradación de calidad correspondiente.
+9. Ejecuta la recuperación mediante Ground Truth.
+10. Realiza las comprobaciones de integridad y finalización del escenario.
 
-## 7. Ejecución completa del Data Lake
+El orden de procesamiento de los escenarios es:
+
+1. Perfect.
+2. Medium.
+3. Poor.
+
+### 6.2. Comprobación previa
+
+Antes de realizar una ejecución completa, es posible ejecutar el modo de preflight:
 
 ```bash
-# 1. Activar entorno virtual
-source .venv/bin/activate
-
-# 2. Iniciar PostgreSQL
-docker compose up -d postgres
-
-# 3. Comprobar disponibilidad de PostgreSQL
-docker compose exec postgres pg_isready -U datalake_user -d health_datalake
-
-# 4. Inicializar la base de datos
-python -m scripts.initialize_dev_db
-
-# 5. Ejecutar pipeline Silver
-python -m scripts.run_silver_pipeline
-
-# 6. Ejecutar pipeline Gold
-python -m scripts.run_gold_pipeline
-
-# 7. Generar versión Medium
-python scripts/quality/quality_generator.py --level medium --execute
-
-# 8. Generar versión Poor
-python scripts/quality/quality_generator.py --level poor --execute
+python -m scripts.run_pipeline --preflight-only
 ```
 
----
+Este modo permite comprobar las condiciones de ejecución sin iniciar los procesos de construcción de las capas.
 
-## 8. Presupuesto de almacenamiento Silver
 
-El proyecto establece un límite máximo de **100.000 celdas lógicas** para la capa Silver.
+## 7. Capa Silver y presupuesto de almacenamiento
 
-El control se implementa mediante `scripts/silver_budget.py` y utiliza un bloqueo transaccional de PostgreSQL para gestionar cargas concurrentes.
+La capa Silver contiene nueve tablas que organizan los datos de salud, demográficos y geográficos.
 
-### 8.1. Distribución
+Entre sus responsabilidades se encuentran:
 
-| Dataset | Registros | Celdas por registro | Total |
-|---|---:|---:|---:|
-| PLACES 2023 | 2.490 | 9 | 22.410 |
-| BRFSS 2023 | 2.800 | 24 | 67.200 |
-| ACS 2024 | 113 | 7 | 791 |
-| ACS County 2024 | 332 | 10 | 3.320 |
-| **Total** | **5.735** | | **93.721** |
+- Tipificación y normalización de variables.
+- Validación de registros.
+- Integración de información geográfica.
+- Separación de entidades y catálogos.
+- Conservación de referencias a los registros de origen.
+- Registro de ejecuciones ETL.
 
-### 8.2. Capacidad
-
-- Capacidad máxima: 100.000 celdas.
-- Consumo: 93.721 celdas.
-- Capacidad disponible: 6.279 celdas.
-- Porcentaje utilizado: 93,721 %.
-
-En BRFSS se contabilizan cuatro campos escalares por registro y veinte claves almacenadas en JSONB.
+El proyecto incorpora un mecanismo de control del presupuesto Silver mediante `scripts/silver/silver_budget.py` y bloqueos transaccionales de PostgreSQL para gestionar cargas concurrentes.
 
 ---
 
-## 9. Validaciones y trazabilidad
+## 8. Validaciones y trazabilidad
 
-La tabla `public.etl_runs` registra las ejecuciones ETL, permitiendo consultar su estado, origen y cantidad de registros procesados y cargados.
+La arquitectura incorpora mecanismos de control para mantener la integridad y trazabilidad de los procesos.
 
-La arquitectura incorpora:
+El esquema `datalake_control` contiene tres tablas:
+
+| Tabla | Responsabilidad |
+|---|---|
+| `etl_runs` | Registro de ejecuciones ETL, estados y cantidades procesadas y cargadas. |
+| `ingestion_batches` | Registro y trazabilidad de los lotes de ingesta Bronze. |
+| `scenario_metadata` | Identificación y configuración del escenario de ejecución. |
+
+Los procesos incorporan:
 
 - Validación de los datos de origen.
+- Validación de manifiestos Bronze.
 - Validación de las ejecuciones Silver.
 - Control de integridad referencial.
 - Validación de dimensiones y tablas de hechos.
 - Verificación de relaciones geográficas.
 - Control de restricciones y columnas obligatorias.
 - Trazabilidad entre las capas Silver y Gold.
+- Identificación de ejecuciones y lotes de origen.
 
-Las tablas de hechos Gold conservan referencias a sus fuentes y a las ejecuciones Silver de origen.
+---
 
-## 10. Modelo dimensional Gold
+## 9. Modelo dimensional Gold
 
 La capa Gold está compuesta por 17 tablas organizadas en dimensiones, tablas de hechos y correspondencias geográficas.
 
@@ -214,15 +257,11 @@ Entre sus componentes se encuentran:
 
 El modelo permite relacionar información sanitaria y demográfica mediante claves geográficas, indicadores y referencias de ejecución.
 
+El proceso Gold contempla validaciones de las tablas de origen, las dimensiones, las relaciones entre entidades y los resultados de integración.
+
 ---
 
-## 11. Generación de versiones degradadas
-
-El proyecto permite estudiar el efecto de la degradación intencional de calidad sobre los datos mediante dos versiones adicionales.
-
-Las degradaciones se aplican sobre copias independientes de la base original, preservando `health_datalake` como referencia sin degradación.
-
-### 11.1. Niveles de degradación
+### 10. Niveles de degradación
 
 | Dimensión | Medium | Poor |
 |---|---:|---:|
@@ -230,45 +269,29 @@ Las degradaciones se aplican sobre copias independientes de la base original, pr
 | Completeness | 5 % | 25 % |
 | Semantic consistency | 5 % | 25 % |
 
-### 11.2. Resultados de la ejecución validada
+### 10.1. Generación y recuperación
 
-La ejecución de referencia generó los siguientes resultados:
+Los procesos de calidad se encuentran organizados en `scripts/quality/`.
 
-| Indicador | Medium | Poor |
-|---|---:|---:|
-| Tablas procesadas | 22 | 22 |
-| Filas de origen | 67.677 | 67.677 |
-| Operaciones planificadas | 4.798 | 23.194 |
-| Celdas únicas a alterar | 4.798 | 23.194 |
-| Constraints verificadas | 112 | 112 |
-| Columnas NOT NULL verificadas | 114 | 114 |
+El coordinador maestro ejecuta la degradación correspondiente a cada escenario y posteriormente realiza el proceso de recuperación mediante Ground Truth.
 
-Ambas bases fueron creadas y validadas correctamente.
+Este mecanismo permite conservar la relación entre los datos originales, las alteraciones introducidas y los resultados recuperados.
 
-Los resultados corresponden a la ejecución de referencia y pueden variar si cambian los datos o las reglas de degradación.
+Los procesos se ejecutan de forma independiente para Medium y Poor. 
 
-### 11.3. Informes de calidad
+### 10.2. Informes de calidad
 
-Los informes generados se almacenan en:
+Los informes de calidad se almacenan en:
 
 ```text
 quality/reports/
 ```
 
-Entre ellos se encuentran:
-
-- `quality_dry_run_rules_medium.csv`
-- `quality_dry_run_changes_medium.csv`
-- `quality_dry_run_summary_medium.csv`
-- `quality_dry_run_rules_poor.csv`
-- `quality_dry_run_changes_poor.csv`
-- `quality_dry_run_summary_poor.csv`
-
-Estos archivos permiten revisar las reglas aplicadas, las operaciones planificadas y los cambios asociados a cada nivel de degradación.
+Los archivos de resultados permiten documentar las reglas aplicadas, las operaciones planificadas y los cambios asociados a cada nivel de degradación.
 
 ---
 
-## 12. Estructura general del proyecto
+## 11. Estructura general del proyecto
 
 ```text
 neurological-data-lake/
@@ -282,11 +305,9 @@ neurological-data-lake/
 ├── requirements-lock.txt
 ├── requirements-dev.txt
 │
-│
 ├── data/
-│   ├── source/
-│   ├── bronze/
-│   └── 
+│   ├── landing/
+│   └── bronze/
 │
 ├── docs/
 │
@@ -294,36 +315,57 @@ neurological-data-lake/
 │   └── reports/
 │
 ├── scripts/
+│   ├── bronze/
+│   │   ├── bronze_simulator.py
+│   │   └── parquet_io.py
+│   │
 │   ├── gold/
+│   │
 │   ├── quality/
+│   │
 │   ├── silver/
-│   ├── initialize_dev_db.py
+│   │
+│   ├── database_config.py
+│   ├── database_connection.py
+│   ├── initialize_database.py
+│   ├── run_pipeline.py
 │   ├── run_silver_pipeline.py
 │   └── run_gold_pipeline.py
 │
 ├── sql/
 │   ├── silver/
+│   │   └── schema_silver.sql
+│   │
 │   └── gold/
+│       ├── schema_gold.sql
 │       └── migrations/
 │
 └── src/
 ```
 
-La estructura representa la organización general del repositorio. Los archivos de datos originales se mantienen fuera del control de versiones.
+La estructura representa los componentes principales de la arquitectura. Los archivos de datos originales y los archivos Parquet generados se mantienen fuera del control de versiones.
 
 ---
 
 ## 13. Estado del proyecto
 
-El proyecto cuenta con una implementación funcional de las capas Bronze, Silver y Gold, junto con la generación automatizada de las bases de datos Medium y Poor.
+El proyecto cuenta con la implementación de las capas Landing, Bronze, Silver y Gold, la generación de escenarios experimentales y mecanismos de control y trazabilidad.
 
-La instalación limpia de referencia fue validada mediante la ejecución completa de los procesos:
+Se han desarrollado:
 
-- Inicialización de PostgreSQL y estructura de tablas.
-- Carga de los cuatro datasets en Silver.
-- Ejecución y validación de las etapas Gold.
-- Integración geográfica PLACES.
-- Generación y validación de `health_datalake_medium`.
-- Generación y validación de `health_datalake_poor`.
+- Simulación reproducible de ingestas Bronze.
+- Generación de archivos Parquet y manifiestos.
+- Metadata de ingesta reducida a siete columnas.
+- Centralización de conexiones PostgreSQL.
+- Organización de las tablas en los esquemas `silver`, `gold` y `datalake_control`.
+- Inicialización controlada de las bases de datos.
+- Coordinación integral de los tres escenarios.
+- Procesos de validación y reanudación de etapas ETL.
+- Generación de escenarios Medium y Poor.
+- Recuperación de información mediante Ground Truth.
 
-**Resultado:** las tres bases de datos —original, Medium y Poor— fueron generadas correctamente, con controles de integridad y validaciones posteriores satisfactorias.
+La ejecución integral se encuentra centralizada en:
+
+```bash
+python -m scripts.run_pipeline
+```

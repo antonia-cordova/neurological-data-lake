@@ -10,7 +10,7 @@ from pathlib import Path
 
 from sqlalchemy import text
 
-from scripts.gold.db_connection import create_gold_engine
+from scripts.database_connection import create_database_engine
 from scripts.gold.resume import classify_geography_counts
 from scripts.database_config import get_target_database
 
@@ -827,7 +827,7 @@ def select_latest_silver_run(conn, name: str, config: dict) -> int:
     run = conn.execute(
         text("""
             SELECT run_id, loaded_rows
-            FROM public.etl_runs
+            FROM datalake_control.etl_runs
             WHERE dataset_name = :dataset_name
               AND target_table = :target_table
               AND status = 'succeeded'
@@ -867,7 +867,7 @@ def select_latest_silver_run(conn, name: str, config: dict) -> int:
 
 def select_latest_geography_run() -> int:
     """Obtiene la ejecución Silver geográfica válida de esta reconstrucción."""
-    engine = create_gold_engine()
+    engine = create_database_engine()
     try:
         with engine.connect() as conn:
             database = conn.execute(
@@ -880,7 +880,7 @@ def select_latest_geography_run() -> int:
             run = conn.execute(
                 text("""
                     SELECT run_id, loaded_rows
-                    FROM public.etl_runs
+                    FROM datalake_control.etl_runs
                     WHERE dataset_name = :dataset_name
                       AND target_table = :target_table
                       AND status = 'succeeded'
@@ -919,8 +919,7 @@ def select_latest_geography_run() -> int:
 def select_source_runs() -> dict[str, int]:
     """Selecciona una única versión Silver para cada fuente."""
 
-    engine = create_gold_engine()
-
+    engine = create_database_engine()
     try:
         with engine.connect() as conn:
             database = conn.execute(
@@ -981,7 +980,7 @@ def execute_stage(
 
 def ensure_integrated_mappings() -> None:
     """Registra y valida los 15 mapeos PLACES y 11 BRFSS del esquema Gold."""
-    engine = create_gold_engine()
+    engine = create_database_engine()
     try:
         with engine.begin() as conn:
             database = conn.execute(
@@ -1022,7 +1021,7 @@ def stage_is_complete(
 ) -> bool:
     """Comprueba el estado de una etapa sin modificar la base de datos."""
 
-    engine = create_gold_engine()
+    engine = create_database_engine()
 
     try:
         with engine.connect() as conn:
@@ -1079,7 +1078,7 @@ def rebuild_gold_for_runs(runs: dict[str, int]) -> None:
     Preserva catálogos, dimensiones compartidas y versiones históricas
     correspondientes a otros source_run_id.
     """
-    engine = create_gold_engine()
+    engine = create_database_engine()
 
     deletions = [
         ("fact_health_integrated", runs["PLACES"]),
@@ -1137,7 +1136,7 @@ def rebuild_gold_for_runs(runs: dict[str, int]) -> None:
 @contextmanager
 def acquire_global_pipeline_lock():
     """Mantiene un advisory lock PostgreSQL durante todo el pipeline."""
-    engine = create_gold_engine()
+    engine = create_database_engine()
     conn = None
     acquired = False
 
@@ -1191,7 +1190,7 @@ def acquire_global_pipeline_lock():
 
 def geography_is_complete() -> bool:
     """True si Gold Geography ya está cargada y validada; False si está vacía."""
-    engine = create_gold_engine()
+    engine = create_database_engine()
     try:
         with engine.connect() as conn:
             database = conn.execute(
@@ -1226,7 +1225,7 @@ def geography_is_complete() -> bool:
 
 def validate_geography_preflight() -> int:
     """Valida Silver/Gold Geography sin insertar, actualizar ni borrar datos."""
-    engine = create_gold_engine()
+    engine = create_database_engine()
 
     try:
         with engine.connect() as conn:
@@ -1241,7 +1240,7 @@ def validate_geography_preflight() -> int:
             run = conn.execute(
                 text("""
                     SELECT run_id, loaded_rows
-                    FROM public.etl_runs
+                    FROM datalake_control.etl_runs
                     WHERE dataset_name = :dataset_name
                       AND target_table = :target_table
                       AND status = 'succeeded'
@@ -1273,11 +1272,11 @@ def validate_geography_preflight() -> int:
             counts = conn.execute(
                 text("""
                     SELECT
-                        (SELECT COUNT(*) FROM public.silver_geography
+                        (SELECT COUNT(*) FROM silver.silver_geography
                          WHERE geography_level = 'STATE') AS silver_states,
-                        (SELECT COUNT(*) FROM public.silver_geography
+                        (SELECT COUNT(*) FROM silver.silver_geography
                          WHERE geography_level = 'COUNTY') AS silver_counties,
-                        (SELECT COUNT(*) FROM public.silver_county) AS silver_county_catalog,
+                        (SELECT COUNT(*) FROM silver.silver_county) AS silver_county_catalog,
                         (SELECT COUNT(*) FROM gold.dim_geography
                          WHERE geography_level = 'STATE') AS gold_states,
                         (SELECT COUNT(*) FROM gold.dim_geography
@@ -1304,7 +1303,7 @@ def validate_geography_preflight() -> int:
                 conn,
                 """
                 SELECT COUNT(*)
-                FROM public.silver_geography sg
+                FROM silver.silver_geography sg
                 LEFT JOIN gold.dim_geography gg
                   ON gg.geography_level = 'STATE'
                  AND gg.location_id = sg.geography_code
@@ -1324,10 +1323,10 @@ def validate_geography_preflight() -> int:
                 conn,
                 """
                 SELECT COUNT(*)
-                FROM public.silver_geography sg
-                LEFT JOIN public.silver_county sc
+                FROM silver.silver_geography sg
+                LEFT JOIN silver.silver_county sc
                     ON sc.geography_id = sg.geography_id
-                LEFT JOIN public.silver_geography sparent
+                LEFT JOIN silver.silver_geography sparent
                   ON sparent.geography_id = sg.parent_geography_id
                 LEFT JOIN gold.dim_geography gg
                   ON gg.geography_level = 'COUNTY'
@@ -1392,8 +1391,8 @@ def validate_geography_preflight() -> int:
                 conn,
                 """
                 SELECT COUNT(*)
-                FROM public.silver_county sc
-                LEFT JOIN public.silver_geography sg
+                FROM silver.silver_county sc
+                LEFT JOIN silver.silver_geography sg
                   ON sg.geography_id = sc.geography_id
                  AND sg.geography_level = 'COUNTY'
                 WHERE sg.geography_id IS NULL

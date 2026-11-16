@@ -10,11 +10,10 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
 import numpy as np
 import pandas as pd
 import pyreadstat
-from sqlalchemy import URL, create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from scripts.bronze.parquet_io import (
     dataset_path,
@@ -28,7 +27,7 @@ from scripts.silver.silver_budget import (
     lock_silver_budget,
 )
 
-from scripts.database_config import get_target_database
+from scripts.database_connection import create_database_engine
 
 ROOT = Path(__file__).resolve().parents[2]
 LANDING_SOURCE_DIR = ROOT / "data" / "landing" / "brfss_2023"
@@ -62,90 +61,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger("etl_brfss")
 
 
-
-
-def create_db_engine() -> Engine:
-    load_dotenv(ROOT / ".env", override=False)
-
-    allowed_database = get_target_database()
-    allowed_host = "localhost"
-    allowed_port = 5432
-
-    database = os.getenv("POSTGRES_DB")
-    host = os.getenv("POSTGRES_HOST")
-    port_raw = os.getenv("POSTGRES_PORT")
-
-    if database != allowed_database:
-        raise RuntimeError(
-            f"Conexión rechazada: base no permitida: {database!r}"
-        )
-
-    if host != allowed_host:
-        raise RuntimeError(
-            f"Conexión rechazada: host no permitido: {host!r}"
-        )
-
-    try:
-        port = int(port_raw)
-    except (TypeError, ValueError):
-        raise RuntimeError(
-            f"Puerto PostgreSQL inválido: {port_raw!r}"
-        )
-
-    if port != allowed_port:
-        raise RuntimeError(
-            f"Conexión rechazada: solo se permite el puerto "
-            f"{allowed_port}. Configurado: {port}"
-        )
-
-    required = [
-        "POSTGRES_USER",
-        "POSTGRES_PASSWORD",
-    ]
-
-    missing = [
-        key for key in required if not os.getenv(key)
-    ]
-
-    if missing:
-        raise RuntimeError(
-            f"Faltan variables PostgreSQL: {', '.join(missing)}"
-        )
-
-    url = URL.create(
-        "postgresql+psycopg",
-        username=os.environ["POSTGRES_USER"],
-        password=os.environ["POSTGRES_PASSWORD"],
-        host=allowed_host,
-        port=allowed_port,
-        database=allowed_database,
-    )
-
-    engine = create_engine(
-        url,
-        pool_pre_ping=True,
-        connect_args={"connect_timeout": 5},
-    )
-
-    try:
-        with engine.connect() as conn:
-            actual_database = conn.execute(
-                text("SELECT current_database()")
-            ).scalar_one()
-
-            if actual_database != allowed_database:
-                raise RuntimeError(
-                    f"Conexión rechazada: PostgreSQL respondió "
-                    f"con la base {actual_database!r}"
-                )
-
-        return engine
-
-    except Exception:
-        engine.dispose()
-        raise
-
-
 def validate_source_files() -> None:
     if not XPT_FILE.is_file():
         raise FileNotFoundError(f"No se encontró el archivo XPT: {XPT_FILE}")
@@ -158,7 +73,7 @@ def validate_target_schema(engine: Engine) -> None:
         SELECT column_name, data_type, character_maximum_length,
                is_nullable, is_identity
         FROM information_schema.columns
-        WHERE table_schema = 'public' AND table_name = :table_name
+        WHERE table_schema = 'silver' AND table_name = :table_name
         ORDER BY ordinal_position
     """)
     expected_schemas = {
@@ -185,7 +100,7 @@ def validate_target_schema(engine: Engine) -> None:
             }
             if actual != expected:
                 raise RuntimeError(
-                    f"Esquema inesperado en public.{table_name}. "
+                    f"Esquema inesperado en silver.{table_name}. "
                     "Ejecuta sql/silver/schema_silver.sql en una base nueva.\n"
                     f"Esperado: {expected}\nActual: {actual}"
                 )
@@ -195,7 +110,7 @@ def validate_target_schema(engine: Engine) -> None:
                 COUNT(*) FILTER (WHERE tc.constraint_type = 'PRIMARY KEY') AS pk_count,
                 COUNT(*) FILTER (WHERE tc.constraint_type = 'FOREIGN KEY') AS fk_count
             FROM information_schema.table_constraints tc
-            WHERE tc.constraint_schema = 'public'
+            WHERE tc.constraint_schema = 'silver'
               AND tc.table_name = 'silver_brfss_2023'
         """)).mappings().one()
         if constraints["pk_count"] != 1 or constraints["fk_count"] != 1:
@@ -207,7 +122,7 @@ def validate_target_schema(engine: Engine) -> None:
 def create_etl_run(engine: Engine) -> int:
     with engine.begin() as conn:
         return int(conn.execute(text("""
-            INSERT INTO public.etl_runs
+            INSERT INTO datalake_control.etl_runs
                 (dataset_name, target_table, started_at, status, source_rows, loaded_rows)
             VALUES (:dataset_name, :target_table, clock_timestamp(), 'running', 0, 0)
             RETURNING run_id
@@ -220,7 +135,7 @@ def update_etl_run(
 ) -> None:
     with engine.begin() as conn:
         conn.execute(text("""
-            UPDATE public.etl_runs
+            UPDATE datalake_control.etl_runs
             SET finished_at = GREATEST(clock_timestamp(), started_at), status = :status,
                 source_rows = :source_rows, loaded_rows = :loaded_rows,
                 error_message = :error_message
@@ -283,10 +198,13 @@ def read_chunks():
         source_columns = [
             name for name in schema.names
             if name not in {
-                "source_record_id", "source_dataset", "source_file",
-                "simulated_received_date", "ingestion_sequence",
-                "ingestion_batch_id", "ingestion_scenario",
-                "is_simulated_ingestion", "source_row_hash",
+                "source_record_id",
+                "source_file",
+                "simulated_received_date",
+                "ingestion_sequence",
+                "ingestion_batch_id",
+                "ingestion_scenario",
+                "source_row_hash",
             }
         ]
         if len(source_columns) != EXPECTED_VARIABLES:
@@ -426,21 +344,21 @@ def load_data(
         })
 
     insert_respondent = text("""
-        INSERT INTO public.silver_respondent
+        INSERT INTO silver.silver_respondent
             (state_fips, sequence_number, run_id)
         VALUES
             (:state_fips, :sequence_number, :run_id)
     """)
 
     insert_responses = text("""
-        INSERT INTO public.silver_brfss_2023 (respondent_id, record_data)
+        INSERT INTO silver.silver_brfss_2023 (respondent_id, record_data)
         SELECT respondent.respondent_id, payload.record_data
         FROM jsonb_to_recordset(CAST(:payload AS jsonb)) AS payload(
             state_fips TEXT,
             sequence_number TEXT,
             record_data JSONB
         )
-        INNER JOIN public.silver_respondent respondent
+        INNER JOIN silver.silver_respondent respondent
             ON respondent.state_fips = payload.state_fips
            AND respondent.sequence_number = payload.sequence_number
            AND respondent.run_id = :run_id
@@ -450,10 +368,10 @@ def load_data(
         lock_silver_budget(conn)
 
         existing_respondents = int(conn.execute(text(
-            "SELECT COUNT(*) FROM public.silver_respondent"
+            "SELECT COUNT(*) FROM silver.silver_respondent"
         )).scalar_one())
         existing_responses = int(conn.execute(text(
-            "SELECT COUNT(*) FROM public.silver_brfss_2023"
+            "SELECT COUNT(*) FROM silver.silver_brfss_2023"
         )).scalar_one())
 
         if (existing_respondents or existing_responses) and not replace:
@@ -465,8 +383,8 @@ def load_data(
 
         if replace:
             # Primero la tabla dependiente; luego la entidad principal.
-            conn.execute(text("DELETE FROM public.silver_brfss_2023"))
-            conn.execute(text("DELETE FROM public.silver_respondent"))
+            conn.execute(text("DELETE FROM silver.silver_brfss_2023"))
+            conn.execute(text("DELETE FROM silver.silver_respondent"))
 
         for start in range(0, len(respondents), INSERT_BATCH_SIZE):
             conn.execute(
@@ -485,13 +403,13 @@ def load_data(
             })
 
         respondent_count = int(conn.execute(text("""
-            SELECT COUNT(*) FROM public.silver_respondent
+            SELECT COUNT(*) FROM silver.silver_respondent
             WHERE run_id = :run_id
         """), {"run_id": run_id}).scalar_one())
         response_count = int(conn.execute(text("""
             SELECT COUNT(*)
-            FROM public.silver_brfss_2023 response
-            INNER JOIN public.silver_respondent respondent
+            FROM silver.silver_brfss_2023 response
+            INNER JOIN silver.silver_respondent respondent
                 ON respondent.respondent_id = response.respondent_id
             WHERE respondent.run_id = :run_id
         """), {"run_id": run_id}).scalar_one())
@@ -504,8 +422,8 @@ def load_data(
             )
         invalid = int(conn.execute(text("""
             SELECT COUNT(*)
-            FROM public.silver_brfss_2023 response
-            INNER JOIN public.silver_respondent respondent
+            FROM silver.silver_brfss_2023 response
+            INNER JOIN silver.silver_respondent respondent
                 ON respondent.respondent_id = response.respondent_id
             WHERE respondent.run_id = :run_id
               AND (
@@ -518,8 +436,8 @@ def load_data(
 
         unmatched = int(conn.execute(text("""
             SELECT COUNT(*)
-            FROM public.silver_respondent respondent
-            LEFT JOIN public.silver_brfss_2023 response
+            FROM silver.silver_respondent respondent
+            LEFT JOIN silver.silver_brfss_2023 response
                 ON response.respondent_id = respondent.respondent_id
             WHERE respondent.run_id = :run_id
               AND response.respondent_id IS NULL
@@ -537,7 +455,7 @@ def load_data(
 
         # El estado succeeded se confirma en la misma transacción que ambas tablas.
         conn.execute(text("""
-            UPDATE public.etl_runs
+            UPDATE datalake_control.etl_runs
             SET finished_at = GREATEST(clock_timestamp(), started_at),
                 status = 'succeeded',
                 source_rows = :source_rows,
@@ -568,7 +486,7 @@ def main() -> int:
     args = parser.parse_args()
 
     validate_source_files()
-    engine = create_db_engine()
+    engine = create_database_engine()
     run_id = None
     source_rows = loaded_rows = 0
     try:

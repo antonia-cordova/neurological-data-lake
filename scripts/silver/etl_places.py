@@ -7,9 +7,8 @@ import os
 import re
 from pathlib import Path
 
-from dotenv import load_dotenv
 import pandas as pd
-from sqlalchemy import URL, create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from scripts.bronze.parquet_io import (
     dataset_path,
@@ -22,7 +21,7 @@ from scripts.silver.silver_budget import (
     lock_silver_budget,
 )
 
-from scripts.database_config import get_target_database
+from scripts.database_connection import create_database_engine
 
 ROOT = Path(__file__).resolve().parents[2]
 LANDING_DIR = ROOT / "data" / "landing" / "places_2025"
@@ -63,89 +62,6 @@ GEO_PATTERN = re.compile(
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 logger = logging.getLogger("etl_places")
-
-
-
-def create_db_engine() -> Engine:
-    load_dotenv(ROOT / ".env", override=False)
-
-    allowed_database = get_target_database()
-    allowed_host = "localhost"
-    allowed_port = 5432
-
-    database = os.getenv("POSTGRES_DB")
-    host = os.getenv("POSTGRES_HOST")
-    port_raw = os.getenv("POSTGRES_PORT")
-
-    if database != allowed_database:
-        raise RuntimeError(
-            f"Conexión rechazada: base no permitida: {database!r}"
-        )
-
-    if host != allowed_host:
-        raise RuntimeError(
-            f"Conexión rechazada: host no permitido: {host!r}"
-        )
-
-    try:
-        port = int(port_raw)
-    except (TypeError, ValueError):
-        raise RuntimeError(
-            f"Puerto PostgreSQL inválido: {port_raw!r}"
-        )
-
-    if port != allowed_port:
-        raise RuntimeError(
-            f"Conexión rechazada: solo se permite el puerto "
-            f"{allowed_port}. Configurado: {port}"
-        )
-
-    required = [
-        "POSTGRES_USER",
-        "POSTGRES_PASSWORD",
-    ]
-
-    missing = [
-        key for key in required if not os.getenv(key)
-    ]
-
-    if missing:
-        raise RuntimeError(
-            f"Faltan variables PostgreSQL: {', '.join(missing)}"
-        )
-
-    url = URL.create(
-        "postgresql+psycopg",
-        username=os.environ["POSTGRES_USER"],
-        password=os.environ["POSTGRES_PASSWORD"],
-        host=allowed_host,
-        port=allowed_port,
-        database=allowed_database,
-    )
-
-    engine = create_engine(
-        url,
-        pool_pre_ping=True,
-        connect_args={"connect_timeout": 5},
-    )
-
-    try:
-        with engine.connect() as conn:
-            actual_database = conn.execute(
-                text("SELECT current_database()")
-            ).scalar_one()
-
-            if actual_database != allowed_database:
-                raise RuntimeError(
-                    f"Conexión rechazada: PostgreSQL respondió "
-                    f"con la base {actual_database!r}"
-                )
-
-        return engine
-
-    except Exception:
-        engine.dispose()
-        raise
 
 
 def find_source_file() -> Path:
@@ -346,7 +262,7 @@ def validate_target_schema(engine: Engine) -> None:
         rows = conn.execute(text("""
             SELECT column_name, data_type, is_nullable
             FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = :table_name
+            WHERE table_schema = 'silver' AND table_name = :table_name
             ORDER BY ordinal_position
         """), {"table_name": TARGET_TABLE}).mappings().all()
 
@@ -376,7 +292,7 @@ def validate_target_schema(engine: Engine) -> None:
 
 def run_etl(replace: bool = False) -> None:
     source = find_source_file()
-    engine = create_db_engine()
+    engine = create_database_engine()
 
     run_id = None
     source_rows = loaded_rows = year_rows = 0
@@ -386,7 +302,7 @@ def run_etl(replace: bool = False) -> None:
 
         with engine.begin() as conn:
             run_id = conn.execute(text("""
-                INSERT INTO public.etl_runs (
+                INSERT INTO datalake_control.etl_runs (
                     dataset_name,
                     target_table,
                     started_at,
@@ -423,7 +339,7 @@ def run_etl(replace: bool = False) -> None:
 
             existing_rows = int(conn.execute(text("""
                 SELECT COUNT(*)
-                FROM public.silver_places_2023
+                FROM silver.silver_places_2023
             """)).scalar_one())
 
             if existing_rows > 0 and not replace:
@@ -440,13 +356,13 @@ def run_etl(replace: bool = False) -> None:
                 )
 
                 conn.execute(text("""
-                    DELETE FROM public.silver_places_2023
+                    DELETE FROM silver.silver_places_2023
                 """))
 
             payload = transformed[TARGET_COLUMNS].to_dict(orient="records")
 
             insert_stmt = text("""
-            INSERT INTO public.silver_places_2023
+            INSERT INTO silver.silver_places_2023
                 (
                     state_abbr,
                     location_name,
@@ -488,7 +404,7 @@ def run_etl(replace: bool = False) -> None:
 
             persisted = int(conn.execute(text("""
                 SELECT COUNT(*)
-                FROM public.silver_places_2023
+                FROM silver.silver_places_2023
             """)).scalar_one())
 
             if persisted != loaded_rows:
@@ -504,7 +420,7 @@ def run_etl(replace: bool = False) -> None:
                     COUNT(DISTINCT run_id) AS distinct_runs,
                     MIN(run_id) AS min_run_id,
                     MAX(run_id) AS max_run_id
-                FROM public.silver_places_2023
+                FROM silver.silver_places_2023
             """)).mappings().one()
 
             if (
@@ -530,7 +446,7 @@ def run_etl(replace: bool = False) -> None:
 
 
             conn.execute(text("""
-                UPDATE public.etl_runs
+                UPDATE datalake_control.etl_runs
                 SET status='succeeded',
                     finished_at=GREATEST(clock_timestamp(), started_at),
                     source_rows=:source_rows,
@@ -560,7 +476,7 @@ def run_etl(replace: bool = False) -> None:
             try:
                 with engine.begin() as conn:
                     conn.execute(text("""
-                        UPDATE public.etl_runs
+                        UPDATE datalake_control.etl_runs
                         SET status='failed',
                             finished_at=GREATEST(clock_timestamp(), started_at),
                             source_rows=:source_rows,

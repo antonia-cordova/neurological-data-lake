@@ -61,13 +61,11 @@ DATASETS = {
 
 METADATA_COLUMNS = [
     "source_record_id",
-    "source_dataset",
     "source_file",
     "simulated_received_date",
     "ingestion_sequence",
     "ingestion_batch_id",
     "ingestion_scenario",
-    "is_simulated_ingestion",
     "source_row_hash",
 ]
 
@@ -238,22 +236,24 @@ def add_ingestion_metadata(
 ) -> pd.DataFrame:
     original = frame.copy()
     count = len(original)
+
     sequence = np.arange(
         start_sequence + 1,
         start_sequence + count + 1,
         dtype=np.int64,
     )
+
     bucket = np.minimum(
         ((sequence - 1) * len(dates)) // total_rows,
         len(dates) - 1,
     )
+
     received_dates = dates.take(bucket).strftime("%Y-%m-%d")
 
     metadata = pd.DataFrame({
         "source_record_id": [
             f"{dataset}:{number:012d}" for number in sequence
         ],
-        "source_dataset": dataset,
         "source_file": source_file,
         "simulated_received_date": received_dates,
         "ingestion_sequence": sequence,
@@ -261,15 +261,16 @@ def add_ingestion_metadata(
             f"{dataset}:{frequency}:{date}" for date in received_dates
         ],
         "ingestion_scenario": frequency,
-        "is_simulated_ingestion": True,
         "source_row_hash": stable_row_hash(original).to_numpy(),
     }, index=original.index)
 
     collisions = set(original.columns).intersection(METADATA_COLUMNS)
+
     if collisions:
         raise ValueError(
             f"Las columnas fuente colisionan con metadatos de ingesta: {sorted(collisions)}"
         )
+
     return pd.concat([original, metadata], axis=1)
 
 

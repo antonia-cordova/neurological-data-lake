@@ -375,7 +375,7 @@ def run_pipeline(scenarios: list[str], test_mode: bool) -> None:
                 durations.append(execute_stage(
                     f"{scenario}/Inicialización de base",
                     [
-                        sys.executable, "-m", "scripts.initialize_dev_db",
+                        sys.executable, "-m", "scripts.initialize_database",
                         "--scenario", scenario,
                     ] + (["--test-mode"] if test_mode else []),
                     environment,

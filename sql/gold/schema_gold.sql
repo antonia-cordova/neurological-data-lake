@@ -246,7 +246,7 @@ CREATE TABLE IF NOT EXISTS gold.fact_area_health (
 
     CONSTRAINT fact_area_health_run_fk
         FOREIGN KEY (source_run_id)
-        REFERENCES public.etl_runs(run_id)
+        REFERENCES datalake_control.etl_runs(run_id)
         ON DELETE RESTRICT,
 
     CONSTRAINT fact_area_health_source_fk
@@ -384,7 +384,7 @@ CREATE TABLE IF NOT EXISTS gold.dim_acs_indicator (
 
     CONSTRAINT dim_acs_indicator_run_fk
         FOREIGN KEY (source_run_id)
-        REFERENCES public.etl_runs(run_id)
+        REFERENCES datalake_control.etl_runs(run_id)
         ON DELETE RESTRICT,
 
     CONSTRAINT dim_acs_indicator_parent_fk
@@ -435,7 +435,7 @@ CREATE TABLE IF NOT EXISTS gold.fact_acs_indicator (
 
     CONSTRAINT fact_acs_indicator_run_fk
         FOREIGN KEY (source_run_id)
-        REFERENCES public.etl_runs(run_id)
+        REFERENCES datalake_control.etl_runs(run_id)
         ON DELETE RESTRICT,
 
     CONSTRAINT fact_acs_indicator_source_fk
@@ -534,7 +534,7 @@ CREATE TABLE IF NOT EXISTS gold.fact_acs_county_indicator (
 
     CONSTRAINT fact_acs_county_indicator_run_fk
         FOREIGN KEY (source_run_id)
-        REFERENCES public.etl_runs(run_id)
+        REFERENCES datalake_control.etl_runs(run_id)
         ON DELETE RESTRICT,
 
     CONSTRAINT fact_acs_county_indicator_source_fk
@@ -686,7 +686,7 @@ CREATE TABLE IF NOT EXISTS gold.fact_brfss_response (
 
     CONSTRAINT fact_brfss_response_run_fk
         FOREIGN KEY (source_run_id)
-        REFERENCES public.etl_runs(run_id)
+        REFERENCES datalake_control.etl_runs(run_id)
         ON DELETE RESTRICT,
 
     CONSTRAINT fact_brfss_response_source_fk
@@ -1082,7 +1082,7 @@ CREATE TABLE IF NOT EXISTS gold.fact_health_integrated (
         REFERENCES gold.dim_source(source_key),
     CONSTRAINT integrated_run_fk
         FOREIGN KEY (source_run_id)
-        REFERENCES public.etl_runs(run_id),
+        REFERENCES datalake_control.etl_runs(run_id),
     CONSTRAINT integrated_measure_fk
         FOREIGN KEY (health_measure_key)
         REFERENCES gold.dim_health_measure(health_measure_key),

@@ -6,8 +6,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any
-from dotenv import load_dotenv
-from sqlalchemy import URL, create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from scripts.bronze.parquet_io import (
@@ -21,7 +20,7 @@ from scripts.silver.silver_budget import (
     lock_silver_budget,
 )
 
-from scripts.database_config import get_target_database
+from scripts.database_connection import create_database_engine
 
 ROOT = Path(__file__).resolve().parents[2]
 BRONZE_DIR = ROOT / "data" / "landing" / "acs_2024_county"
@@ -44,93 +43,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger("etl_acs_county")
 
 
-
-def db_engine() -> Engine:
-    load_dotenv(ROOT / ".env", override=False)
-
-    allowed_database = get_target_database()
-    allowed_host = "localhost"
-    allowed_port = 5432
-
-    database = os.getenv("POSTGRES_DB")
-    host = os.getenv("POSTGRES_HOST")
-    port_raw = os.getenv("POSTGRES_PORT")
-
-    if database != allowed_database:
-        raise RuntimeError(
-            f"Conexión rechazada: base no permitida: {database!r}"
-        )
-
-    if host != allowed_host:
-        raise RuntimeError(
-            f"Conexión rechazada: host no permitido: {host!r}"
-        )
-
-    try:
-        port = int(port_raw)
-    except (TypeError, ValueError):
-        raise RuntimeError(
-            f"Puerto PostgreSQL inválido: {port_raw!r}"
-        )
-
-    if port != allowed_port:
-        raise RuntimeError(
-            f"Conexión rechazada: solo se permite el puerto "
-            f"{allowed_port}. Configurado: {port}"
-        )
-
-    required = [
-        "POSTGRES_USER",
-        "POSTGRES_PASSWORD",
-    ]
-
-    missing = [
-        key for key in required if not os.getenv(key)
-    ]
-
-    if missing:
-        raise RuntimeError(
-            f"Faltan variables PostgreSQL: {', '.join(missing)}"
-        )
-
-    url = URL.create(
-        "postgresql+psycopg",
-        username=os.environ["POSTGRES_USER"],
-        password=os.environ["POSTGRES_PASSWORD"],
-        host=allowed_host,
-        port=allowed_port,
-        database=allowed_database,
-    )
-
-    engine = create_engine(
-        url,
-        pool_pre_ping=True,
-        connect_args={"connect_timeout": 5},
-    )
-
-    try:
-        with engine.connect() as conn:
-            actual_database = conn.execute(
-                text("SELECT current_database()")
-            ).scalar_one()
-
-            if actual_database != allowed_database:
-                raise RuntimeError(
-                    f"Conexión rechazada: PostgreSQL respondió "
-                    f"con la base {actual_database!r}"
-                )
-
-        return engine
-
-    except Exception:
-        engine.dispose()
-        raise
-
-
 def start_run(engine: Engine) -> int:
     with engine.begin() as conn:
         return int(conn.execute(text("""
-            INSERT INTO public.etl_runs
+            INSERT INTO datalake_control.etl_runs
                 (dataset_name, target_table, started_at, status, source_rows, loaded_rows)
             VALUES
                 (:dataset, :target, clock_timestamp(), 'running', 0, 0)
@@ -151,7 +67,7 @@ def finish_run(
 ) -> None:
     with engine.begin() as conn:
         conn.execute(text("""
-            UPDATE public.etl_runs
+            UPDATE datalake_control.etl_runs
             SET finished_at = GREATEST(clock_timestamp(), started_at),
                 status = :status,
                 source_rows = :source_rows,
@@ -182,7 +98,7 @@ def target_geographies(engine: Engine) -> dict[str, dict[str, str]]:
                 MIN(location_name) AS location_name,
                 COUNT(DISTINCT state_abbr) AS state_variants,
                 COUNT(DISTINCT location_name) AS name_variants
-            FROM public.silver_places_2023
+            FROM silver.silver_places_2023
             GROUP BY location_id
             ORDER BY location_id
         """)).mappings().all()
@@ -526,7 +442,7 @@ def load_silver(
 
     # 2. Preparar sentencia de inserción.
     insert = text("""
-        INSERT INTO public.silver_acs_county_2024 (
+        INSERT INTO silver.silver_acs_county_2024 (
             state_fips,
             county_fips,
             geography_id,
@@ -561,7 +477,7 @@ def load_silver(
         # Comprobar si ya existen registros ACS County.
         existing_count = conn.execute(text("""
             SELECT COUNT(*)
-            FROM public.silver_acs_county_2024
+            FROM silver.silver_acs_county_2024
         """)).scalar_one()
 
         if existing_count > 0:
@@ -578,7 +494,7 @@ def load_silver(
             # Verificar que la carga existente esté íntegra.
             existing_runs = conn.execute(text("""
                 SELECT COUNT(DISTINCT run_id)
-                FROM public.silver_acs_county_2024
+                FROM silver.silver_acs_county_2024
             """)).scalar_one()
 
             if (
@@ -600,7 +516,7 @@ def load_silver(
 
             # Eliminar la carga anterior dentro de la transacción.
             conn.execute(text("""
-                DELETE FROM public.silver_acs_county_2024
+                DELETE FROM silver.silver_acs_county_2024
             """))
 
         # 4. Insertar los registros de la nueva ejecución.
@@ -620,7 +536,7 @@ def load_silver(
                 COUNT(DISTINCT variable_code) AS total_variables,
                 COUNT(DISTINCT (geography_id, variable_code))
                     AS unique_combinations
-            FROM public.silver_acs_county_2024
+            FROM silver.silver_acs_county_2024
             WHERE run_id = :run_id
         """), {"run_id": run_id}).mappings().one()
 
@@ -689,7 +605,7 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    engine = db_engine()
+    engine = create_database_engine()
     run_id = None
     source_rows = loaded_rows = 0
 

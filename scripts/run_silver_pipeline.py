@@ -94,7 +94,7 @@ def latest_etl_run(conn, job: ETLJob):
     row = conn.execute(
         """
         SELECT run_id, status, loaded_rows, finished_at
-        FROM public.etl_runs
+        FROM datalake_control.etl_runs
         WHERE dataset_name = %s AND target_table = %s
         ORDER BY run_id DESC
         LIMIT 1
@@ -110,10 +110,10 @@ def inspect_job_state(conn, key: str) -> str:
 
     if key == "catalogs":
         source_count = conn.execute(
-            "SELECT COUNT(*) FROM public.silver_source"
+            "SELECT COUNT(*) FROM silver.silver_source"
         ).fetchone()[0]
         indicator_count = conn.execute(
-            "SELECT COUNT(*) FROM public.silver_health_indicator"
+            "SELECT COUNT(*) FROM silver.silver_health_indicator"
         ).fetchone()[0]
         if source_count == 0 and indicator_count == 0:
             return "pending"
@@ -129,11 +129,11 @@ def inspect_job_state(conn, key: str) -> str:
         counts = conn.execute(
             """
             SELECT COUNT(*), COUNT(*) FILTER (WHERE run_id = (
-                SELECT run_id FROM public.etl_runs
+                SELECT run_id FROM datalake_control.etl_runs
                 WHERE dataset_name=%s AND target_table=%s
                 ORDER BY run_id DESC LIMIT 1
             ))
-            FROM public.silver_acs_2024
+            FROM silver.silver_acs_2024
             """,
             (job.dataset_name, job.target_table),
         ).fetchone()
@@ -143,11 +143,11 @@ def inspect_job_state(conn, key: str) -> str:
         counts = conn.execute(
             """
             SELECT COUNT(*), COUNT(*) FILTER (WHERE run_id = (
-                SELECT run_id FROM public.etl_runs
+                SELECT run_id FROM datalake_control.etl_runs
                 WHERE dataset_name=%s AND target_table=%s
                 ORDER BY run_id DESC LIMIT 1
             ))
-            FROM public.silver_places_2023
+            FROM silver.silver_places_2023
             """,
             (job.dataset_name, job.target_table),
         ).fetchone()
@@ -157,11 +157,11 @@ def inspect_job_state(conn, key: str) -> str:
         counts = conn.execute(
             """
             SELECT COUNT(*), COUNT(*) FILTER (WHERE run_id = (
-                SELECT run_id FROM public.etl_runs
+                SELECT run_id FROM datalake_control.etl_runs
                 WHERE dataset_name=%s AND target_table=%s
                 ORDER BY run_id DESC LIMIT 1
             ))
-            FROM public.silver_acs_county_2024
+            FROM silver.silver_acs_county_2024
             """,
             (job.dataset_name, job.target_table),
         ).fetchone()
@@ -172,10 +172,10 @@ def inspect_job_state(conn, key: str) -> str:
         run_id = latest[0] if latest else None
         if run_id is None:
             respondents = int(conn.execute(
-                "SELECT COUNT(*) FROM public.silver_respondent"
+                "SELECT COUNT(*) FROM silver.silver_respondent"
             ).fetchone()[0])
             responses = int(conn.execute(
-                "SELECT COUNT(*) FROM public.silver_brfss_2023"
+                "SELECT COUNT(*) FROM silver.silver_brfss_2023"
             ).fetchone()[0])
             if respondents == 0 and responses == 0:
                 return "pending"
@@ -185,12 +185,12 @@ def inspect_job_state(conn, key: str) -> str:
         respondents, responses, invalid = conn.execute(
             """
             SELECT
-                (SELECT COUNT(*) FROM public.silver_respondent WHERE run_id=%s),
-                (SELECT COUNT(*) FROM public.silver_brfss_2023 r
-                 JOIN public.silver_respondent p ON p.respondent_id=r.respondent_id
+                (SELECT COUNT(*) FROM silver.silver_respondent WHERE run_id=%s),
+                (SELECT COUNT(*) FROM silver.silver_brfss_2023 r
+                 JOIN silver.silver_respondent p ON p.respondent_id=r.respondent_id
                  WHERE p.run_id=%s),
-                (SELECT COUNT(*) FROM public.silver_brfss_2023 r
-                 JOIN public.silver_respondent p ON p.respondent_id=r.respondent_id
+                (SELECT COUNT(*) FROM silver.silver_brfss_2023 r
+                 JOIN silver.silver_respondent p ON p.respondent_id=r.respondent_id
                  WHERE p.run_id=%s AND
                    (jsonb_typeof(r.record_data) <> 'object'
                     OR (SELECT COUNT(*) FROM jsonb_object_keys(r.record_data)) <> 20))
@@ -198,10 +198,10 @@ def inspect_job_state(conn, key: str) -> str:
             (run_id, run_id, run_id),
         ).fetchone()
         total_respondents = int(conn.execute(
-            "SELECT COUNT(*) FROM public.silver_respondent"
+            "SELECT COUNT(*) FROM silver.silver_respondent"
         ).fetchone()[0])
         total_responses = int(conn.execute(
-            "SELECT COUNT(*) FROM public.silver_brfss_2023"
+            "SELECT COUNT(*) FROM silver.silver_brfss_2023"
         ).fetchone()[0])
         if latest[1] == "succeeded" and latest[3] is not None:
             if (
@@ -224,9 +224,9 @@ def inspect_job_state(conn, key: str) -> str:
         states, counties, county_catalog = conn.execute(
             """
             SELECT
-                (SELECT COUNT(*) FROM public.silver_geography WHERE geography_level='STATE'),
-                (SELECT COUNT(*) FROM public.silver_geography WHERE geography_level='COUNTY'),
-                (SELECT COUNT(*) FROM public.silver_county)
+                (SELECT COUNT(*) FROM silver.silver_geography WHERE geography_level='STATE'),
+                (SELECT COUNT(*) FROM silver.silver_geography WHERE geography_level='COUNTY'),
+                (SELECT COUNT(*) FROM silver.silver_county)
             """
         ).fetchone()
         states, counties, county_catalog = map(int, (states, counties, county_catalog))

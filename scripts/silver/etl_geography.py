@@ -6,18 +6,15 @@ import os
 import re
 from pathlib import Path
 
-from dotenv import load_dotenv
-from sqlalchemy import URL, create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from scripts.silver.silver_budget import lock_silver_budget
-
+from scripts.database_connection import create_database_engine
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
-
-from scripts.database_config import get_target_database
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -32,94 +29,6 @@ logging.basicConfig(
 )
 
 log = logging.getLogger("etl_geography")
-
-
-# ============================================================
-# DATABASE CONNECTION
-# ============================================================
-
-def create_db_engine() -> Engine:
-    load_dotenv(ROOT / ".env", override=False)
-
-    allowed_database = get_target_database()
-    allowed_host = "localhost"
-    allowed_port = 5432
-
-    database = os.getenv("POSTGRES_DB")
-    host = os.getenv("POSTGRES_HOST")
-    port_raw = os.getenv("POSTGRES_PORT")
-
-    if database != allowed_database:
-        raise RuntimeError(
-            f"Conexión rechazada: base no permitida: {database!r}"
-        )
-
-    if host != allowed_host:
-        raise RuntimeError(
-            f"Conexión rechazada: host no permitido: {host!r}"
-        )
-
-    try:
-        port = int(port_raw)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError(
-            f"Puerto PostgreSQL inválido: {port_raw!r}"
-        ) from exc
-
-    if port != allowed_port:
-        raise RuntimeError(
-            f"Conexión rechazada: solo se permite el puerto "
-            f"{allowed_port}. Configurado: {port}"
-        )
-
-    required = [
-        "POSTGRES_USER",
-        "POSTGRES_PASSWORD",
-    ]
-
-    missing = [
-        key for key in required
-        if not os.getenv(key)
-    ]
-
-    if missing:
-        raise RuntimeError(
-            f"Faltan variables PostgreSQL: {', '.join(missing)}"
-        )
-
-    url = URL.create(
-        "postgresql+psycopg",
-        username=os.environ["POSTGRES_USER"],
-        password=os.environ["POSTGRES_PASSWORD"],
-        host=allowed_host,
-        port=allowed_port,
-        database=allowed_database,
-    )
-
-    engine = create_engine(
-        url,
-        pool_pre_ping=True,
-        connect_args={"connect_timeout": 5},
-    )
-
-    try:
-        with engine.connect() as conn:
-            actual_database = conn.execute(
-                text("SELECT current_database()")
-            ).scalar_one()
-
-            if actual_database != allowed_database:
-                raise RuntimeError(
-                    f"PostgreSQL respondió con la base "
-                    f"{actual_database!r}"
-                )
-
-        return engine
-
-    except Exception:
-        engine.dispose()
-        raise
-
 
 # ============================================================
 # TARGET SCHEMA VALIDATION
@@ -138,7 +47,7 @@ def validate_target_tables(engine: Engine) -> None:
                 text("""
                     SELECT table_name
                     FROM information_schema.tables
-                    WHERE table_schema = 'public'
+                    WHERE table_schema = 'silver'
                       AND table_name IN (
                           'silver_geography',
                           'silver_county'
@@ -167,7 +76,7 @@ def start_run(engine: Engine) -> int:
 
         run_id = conn.execute(
             text("""
-                INSERT INTO public.etl_runs (
+                INSERT INTO datalake_control.etl_runs (
                     dataset_name,
                     target_table,
                     started_at,
@@ -207,7 +116,7 @@ def finish_run(
 
         conn.execute(
             text("""
-                UPDATE public.etl_runs
+                UPDATE datalake_control.etl_runs
                 SET
                     finished_at = GREATEST(
                         clock_timestamp(),
@@ -264,7 +173,7 @@ def collect_geographies(
                     MIN(geography_name) AS geography_name,
                     COUNT(*) AS variable_rows,
                     COUNT(DISTINCT geography_name) AS name_variants
-                FROM public.silver_acs_county_2024
+                FROM silver.silver_acs_county_2024
                 GROUP BY
                     geography_id,
                     state_fips,
@@ -316,7 +225,7 @@ def collect_geographies(
                            OR (latitude IS NOT NULL AND longitude IS NULL)
                     ) AS incomplete_coordinates
 
-                FROM public.silver_places_2023
+                FROM silver.silver_places_2023
                 GROUP BY location_id
                 ORDER BY location_id
             """)
@@ -654,7 +563,7 @@ def load_geographies(
 
             conn.execute(
                 text("""
-                    INSERT INTO public.silver_geography (
+                    INSERT INTO silver.silver_geography (
                         geography_level,
                         geography_code,
                         geography_name,
@@ -693,7 +602,7 @@ def load_geographies(
                     SELECT
                         geography_code,
                         geography_id
-                    FROM public.silver_geography
+                    FROM silver.silver_geography
                     WHERE geography_level = 'STATE'
                       AND geography_code = ANY(:codes)
                 """),
@@ -722,7 +631,7 @@ def load_geographies(
 
             conn.execute(
                 text("""
-                    INSERT INTO public.silver_geography (
+                    INSERT INTO silver.silver_geography (
                         geography_level,
                         geography_code,
                         geography_name,
@@ -768,7 +677,7 @@ def load_geographies(
                     SELECT
                         geography_code,
                         geography_id
-                    FROM public.silver_geography
+                    FROM silver.silver_geography
                     WHERE geography_level = 'COUNTY'
                       AND geography_code = ANY(:codes)
                 """),
@@ -795,7 +704,7 @@ def load_geographies(
 
             conn.execute(
                 text("""
-                    INSERT INTO public.silver_county (
+                    INSERT INTO silver.silver_county (
                         geography_id,
                         state_fips,
                         county_fips,
@@ -857,7 +766,7 @@ def load_geographies(
                         WHERE sg.geography_level = 'COUNTY'
                           AND NOT EXISTS (
                               SELECT 1
-                              FROM public.silver_geography parent
+                              FROM silver.silver_geography parent
                               WHERE parent.geography_id =
                                     sg.parent_geography_id
                                 AND parent.geography_level = 'STATE'
@@ -866,7 +775,7 @@ def load_geographies(
                           )
                     ) AS counties_with_invalid_parent
 
-                FROM public.silver_geography sg
+                FROM silver.silver_geography sg
                 WHERE sg.geography_code = ANY(:codes)
             """),
             {
@@ -882,8 +791,8 @@ def load_geographies(
             conn.execute(
                 text("""
                     SELECT COUNT(*)
-                    FROM public.silver_county sc
-                    INNER JOIN public.silver_geography sg
+                    FROM silver.silver_county sc
+                    INNER JOIN silver.silver_geography sg
                         ON sc.geography_id = sg.geography_id
                     WHERE sg.geography_level = 'COUNTY'
                       AND sg.geography_code = ANY(:codes)
@@ -948,8 +857,7 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    engine = create_db_engine()
-
+    engine = create_database_engine()
     run_id = None
     source_rows = 0
     loaded_rows = 0

@@ -5,8 +5,7 @@ import logging
 from sqlalchemy import text
 from decimal import Decimal, InvalidOperation
 
-from scripts.gold.db_connection import create_gold_engine
-
+from scripts.database_connection import create_database_engine
 
 EXPECTED_DATASET = "geography_catalog"
 EXPECTED_TARGET = "silver_geography+silver_county"
@@ -33,7 +32,7 @@ def validate_source_run(conn, source_run_id: int) -> None:
                 source_rows,
                 loaded_rows,
                 finished_at
-            FROM public.etl_runs
+            FROM datalake_control.etl_runs
             WHERE run_id = :run_id
         """),
         {"run_id": source_run_id},
@@ -83,8 +82,8 @@ def read_and_validate_catalog(conn) -> list[dict]:
     # Evita modificaciones concurrentes mientras se consume Silver.
     conn.execute(text("""
         LOCK TABLE
-            public.silver_geography,
-            public.silver_county
+            silver.silver_geography,
+            silver.silver_county
         IN SHARE MODE
     """))
 
@@ -118,12 +117,12 @@ def read_and_validate_catalog(conn) -> list[dict]:
                   AND sg.parent_geography_id IS NOT NULL
             ) AS states_with_parent
 
-        FROM public.silver_geography sg
+        FROM silver.silver_geography sg
 
-        LEFT JOIN public.silver_county sc
+        LEFT JOIN silver.silver_county sc
             ON sc.geography_id = sg.geography_id
 
-        LEFT JOIN public.silver_geography parent
+        LEFT JOIN silver.silver_geography parent
             ON parent.geography_id = sg.parent_geography_id
     """)).mappings().one()
 
@@ -156,12 +155,12 @@ def read_and_validate_catalog(conn) -> list[dict]:
             sc.state_abbr,
             parent.geography_code AS parent_state_fips
 
-        FROM public.silver_geography sg
+        FROM silver.silver_geography sg
 
-        INNER JOIN public.silver_county sc
+        INNER JOIN silver.silver_county sc
             ON sc.geography_id = sg.geography_id
 
-        INNER JOIN public.silver_geography parent
+        INNER JOIN silver.silver_geography parent
             ON parent.geography_id = sg.parent_geography_id
 
         WHERE sg.geography_level = 'COUNTY'
@@ -192,12 +191,12 @@ def read_and_validate_catalog(conn) -> list[dict]:
                 WHERE gold_state.state_abbr <> county.state_abbr
             ) AS abbreviation_mismatches
 
-        FROM public.silver_county county
+        FROM silver.silver_county county
 
-        INNER JOIN public.silver_geography county_geo
+        INNER JOIN silver.silver_geography county_geo
             ON county_geo.geography_id = county.geography_id
 
-        INNER JOIN public.silver_geography silver_state
+        INNER JOIN silver.silver_geography silver_state
             ON silver_state.geography_code = county.state_fips
            AND silver_state.geography_level = 'STATE'
 
@@ -261,7 +260,7 @@ def validate_gold_state_catalog(conn) -> None:
             gold.location_name,
             gold.state_abbr
 
-        FROM public.silver_geography silver
+        FROM silver.silver_geography silver
 
         LEFT JOIN gold.dim_geography gold
             ON gold.location_id = silver.geography_code
@@ -532,7 +531,7 @@ def validate_loaded_counties(conn, records: list[dict]) -> None:
 
 
 def run_etl(source_run_id: int, dry_run: bool = False) -> None:
-    engine = create_gold_engine()
+    engine = create_database_engine()
 
     try:
         with engine.begin() as conn:

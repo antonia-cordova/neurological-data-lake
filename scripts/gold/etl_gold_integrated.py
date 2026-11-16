@@ -1,18 +1,18 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 import argparse
 import logging
 import os
 from pathlib import Path
 from typing import Any
 from sqlalchemy import text
-from scripts.gold.db_connection import create_gold_engine
+from scripts.database_connection import create_database_engine
 from sqlalchemy.engine import Connection
 from scripts.gold.silver_run_validator import resolve_single_silver_run_id
 
 ROOT = Path(__file__).resolve().parents[1]
 
 SOURCE_CODE = "PLACES"
-SOURCE_TABLE = "public.silver_places_2023"
+SOURCE_TABLE = "silver.silver_places_2023"
 DATASET_NAME = "places_2025"
 EXPECTED_SILVER_ROWS = 2490
 EXPECTED_BASE_ROWS = 2490
@@ -43,7 +43,7 @@ def resolve_and_validate_places_run(
         text(
             """
             SELECT dataset_name, target_table, loaded_rows, status, finished_at
-            FROM public.etl_runs
+            FROM datalake_control.etl_runs
             WHERE run_id = :run_id
             """
         ),
@@ -174,7 +174,7 @@ def validate_base_places_facts(
         text(
             """
             SELECT COUNT(DISTINCT measure_id)
-            FROM public.silver_places_2023
+            FROM silver.silver_places_2023
             """
         )
     ).scalar_one()
@@ -427,7 +427,7 @@ def load_integrated_places_facts(
 
 
 def run_etl(places_run_id: int | None = None) -> None:
-    engine = create_gold_engine()
+    engine = create_database_engine()
 
     try:
         with engine.begin() as conn:

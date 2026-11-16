@@ -1,3 +1,6 @@
+
+from __future__ import annotations
+
 import os
 from pathlib import Path
 
@@ -7,17 +10,24 @@ from sqlalchemy.engine import Engine
 
 from scripts.database_config import get_target_database
 
-ROOT = Path(__file__).resolve().parents[2]
-
-EXPECTED_HOST = "localhost"
-EXPECTED_PORT = 5432
+ROOT = Path(__file__).resolve().parents[1]
 
 
-def create_gold_engine() -> Engine:
+def create_database_engine() -> Engine:
+    """
+    Crea y valida un SQLAlchemy Engine para la base autorizada
+    por el escenario seleccionado.
+
+    La autorización del escenario, base, host y puerto se delega
+    en database_config.py.
+    """
+
     load_dotenv(ROOT / ".env", override=False)
 
+    # Resuelve y valida el destino autorizado.
+    database = get_target_database()
+
     required = [
-        "POSTGRES_DB",
         "POSTGRES_USER",
         "POSTGRES_PASSWORD",
         "POSTGRES_HOST",
@@ -31,36 +41,17 @@ def create_gold_engine() -> Engine:
 
     if missing:
         raise RuntimeError(
-            f"Faltan variables de conexi?n: {', '.join(missing)}"
+            f"Faltan variables de conexión PostgreSQL: {', '.join(missing)}"
         )
 
-    database = get_target_database()
-    host = os.getenv("POSTGRES_HOST")
+    host = os.environ["POSTGRES_HOST"]
 
     try:
         port = int(os.environ["POSTGRES_PORT"])
     except ValueError as exc:
         raise RuntimeError(
-            "POSTGRES_PORT debe ser un n?mero entero."
+            "POSTGRES_PORT debe ser un número entero."
         ) from exc
-
-    if database != get_target_database():
-        raise RuntimeError(
-            f"Conexi?n bloqueada: base '{database}'. "
-            f"Base no autorizada para el escenario seleccionado: {database}."
-        )
-
-    if host != EXPECTED_HOST:
-        raise RuntimeError(
-            f"Conexi?n bloqueada: host '{host}'. "
-            f"Solo se permite '{EXPECTED_HOST}'."
-        )
-
-    if port != EXPECTED_PORT:
-        raise RuntimeError(
-            f"Conexi?n bloqueada: puerto {port}. "
-            f"Solo se permite {EXPECTED_PORT}."
-        )
 
     url = URL.create(
         "postgresql+psycopg",
@@ -85,8 +76,9 @@ def create_gold_engine() -> Engine:
 
             if actual_database != database:
                 raise RuntimeError(
-                    "Conexi?n rechazada: PostgreSQL respondi? "
-                    f"con la base '{actual_database}'."
+                    "Conexión rechazada: PostgreSQL respondió "
+                    f"con la base '{actual_database}', "
+                    f"pero se esperaba '{database}'."
                 )
 
         return engine

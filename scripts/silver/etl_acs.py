@@ -4,9 +4,8 @@ import logging
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
 import pandas as pd
-from sqlalchemy import URL, create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from scripts.bronze.parquet_io import (
     dataset_path,
@@ -19,7 +18,7 @@ from scripts.silver.silver_budget import (
     lock_silver_budget,
 )
 
-from scripts.database_config import get_target_database
+from scripts.database_connection import create_database_engine
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE_DIR = ROOT / "data" / "landing" / "acs_2024"
@@ -77,89 +76,6 @@ def locate_source_file(explicit_path: str | None = None) -> Path:
     return candidates[0]
 
 
-
-
-def create_db_engine() -> Engine:
-    load_dotenv(ROOT / ".env", override=False)
-
-    allowed_database = get_target_database()
-    allowed_host = "localhost"
-    allowed_port = 5432
-
-    database = os.getenv("POSTGRES_DB")
-    host = os.getenv("POSTGRES_HOST")
-    port_raw = os.getenv("POSTGRES_PORT")
-
-    if database != allowed_database:
-        raise RuntimeError(
-            f"Conexión rechazada: base no permitida: {database!r}"
-        )
-
-    if host != allowed_host:
-        raise RuntimeError(
-            f"Conexión rechazada: host no permitido: {host!r}"
-        )
-
-    try:
-        port = int(port_raw)
-    except (TypeError, ValueError):
-        raise RuntimeError(
-            f"Puerto PostgreSQL inválido: {port_raw!r}"
-        )
-
-    if port != allowed_port:
-        raise RuntimeError(
-            f"Conexión rechazada: solo se permite el puerto "
-            f"{allowed_port}. Configurado: {port}"
-        )
-
-    required = [
-        "POSTGRES_USER",
-        "POSTGRES_PASSWORD",
-    ]
-
-    missing = [
-        key for key in required if not os.getenv(key)
-    ]
-
-    if missing:
-        raise RuntimeError(
-            f"Faltan variables PostgreSQL: {', '.join(missing)}"
-        )
-
-    url = URL.create(
-        "postgresql+psycopg",
-        username=os.environ["POSTGRES_USER"],
-        password=os.environ["POSTGRES_PASSWORD"],
-        host=allowed_host,
-        port=allowed_port,
-        database=allowed_database,
-    )
-
-    engine = create_engine(
-        url,
-        pool_pre_ping=True,
-        connect_args={"connect_timeout": 5},
-    )
-
-    try:
-        with engine.connect() as conn:
-            actual_database = conn.execute(
-                text("SELECT current_database()")
-            ).scalar_one()
-
-            if actual_database != allowed_database:
-                raise RuntimeError(
-                    f"Conexión rechazada: PostgreSQL respondió "
-                    f"con la base {actual_database!r}"
-                )
-
-        return engine
-
-    except Exception:
-        engine.dispose()
-        raise
-
 def validate_source_file(source_file: Path) -> pd.DataFrame:
     # En el flujo maestro, Silver consume exclusivamente el Parquet simulado.
     # La lectura CSV queda como compatibilidad para ejecuciones heredadas.
@@ -204,7 +120,7 @@ def validate_target_schema(engine: Engine) -> None:
     query = text("""
         SELECT column_name, data_type, is_nullable, is_identity
         FROM information_schema.columns
-        WHERE table_schema = 'public'
+        WHERE table_schema = 'silver'
           AND table_name = :table_name
         ORDER BY ordinal_position
     """)
@@ -228,14 +144,14 @@ def validate_target_schema(engine: Engine) -> None:
     }
     if actual != expected:
         raise RuntimeError(
-            f"Esquema inesperado en public.{TARGET_TABLE}.\n"
+            f"Esquema inesperado en silver.{TARGET_TABLE}.\n"
             f"Esperado: {expected}\nActual: {actual}"
         )
 
 
 def create_etl_run(engine: Engine) -> int:
     stmt = text("""
-        INSERT INTO public.etl_runs
+        INSERT INTO datalake_control.etl_runs
             (dataset_name, target_table, started_at, status, source_rows, loaded_rows)
         VALUES
             (:dataset_name, :target_table, clock_timestamp(), 'running', 0, 0)
@@ -258,7 +174,7 @@ def update_etl_run(
     error_message: str | None = None,
 ) -> None:
     stmt = text("""
-        UPDATE public.etl_runs
+        UPDATE datalake_control.etl_runs
         SET finished_at = GREATEST(
                 clock_timestamp(),
                 started_at
@@ -302,7 +218,7 @@ def load_data(
     records = prepare_records(source_df, run_id)
 
     insert_stmt = text("""
-        INSERT INTO public.silver_acs_2024
+        INSERT INTO silver.silver_acs_2024
             (label_grouping, estimate, margin_of_error, percent,
              percent_margin_of_error, run_id)
         VALUES
@@ -313,7 +229,7 @@ def load_data(
     with engine.begin() as conn:
         lock_silver_budget(conn)
         existing = int(
-            conn.execute(text("SELECT COUNT(*) FROM public.silver_acs_2024")).scalar_one()
+            conn.execute(text("SELECT COUNT(*) FROM silver.silver_acs_2024")).scalar_one()
         )
         if existing and not replace:
             raise RuntimeError(
@@ -322,7 +238,7 @@ def load_data(
             )
         if replace:
             logger.warning("Se reemplazarán los registros existentes de silver_acs_2024.")
-            conn.execute(text("DELETE FROM public.silver_acs_2024"))
+            conn.execute(text("DELETE FROM silver.silver_acs_2024"))
 
         for start in range(0, len(records), INSERT_BATCH_SIZE):
             batch = records[start:start + INSERT_BATCH_SIZE]
@@ -338,7 +254,7 @@ def load_data(
 
         persisted = int(conn.execute(
             text("""
-                SELECT COUNT(*) FROM public.silver_acs_2024
+                SELECT COUNT(*) FROM silver.silver_acs_2024
                 WHERE run_id = :run_id
             """),
             {"run_id": run_id},
@@ -350,7 +266,7 @@ def load_data(
 
         invalid_labels = int(conn.execute(
             text("""
-                SELECT COUNT(*) FROM public.silver_acs_2024
+                SELECT COUNT(*) FROM silver.silver_acs_2024
                 WHERE run_id = :run_id
                   AND (label_grouping IS NULL OR BTRIM(label_grouping) = '')
             """),
@@ -403,12 +319,12 @@ def main() -> int:
             source_rows, len(source_df.columns),
         )
 
-        engine = create_db_engine()
+        engine = create_database_engine()
         validate_target_schema(engine)
 
         with engine.connect() as conn:
             existing = int(
-                conn.execute(text("SELECT COUNT(*) FROM public.silver_acs_2024")).scalar_one()
+                conn.execute(text("SELECT COUNT(*) FROM silver.silver_acs_2024")).scalar_one()
             )
         if existing and not args.replace:
             raise RuntimeError(

@@ -8,9 +8,8 @@ import re
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
 import pandas as pd
-from sqlalchemy import URL, create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from scripts.bronze.parquet_io import (
@@ -20,7 +19,7 @@ from scripts.bronze.parquet_io import (
     validate_dataset_manifest,
 )
 
-from scripts.database_config import get_target_database
+from scripts.database_connection import create_database_engine
 
 ROOT = Path(__file__).resolve().parents[2]
 LANDING_ACS_DIR = ROOT / "data" / "landing" / "acs_2024"
@@ -137,62 +136,6 @@ PLACES_CATEGORY = {
     "DIABETES": ("Diabetes prevalence", "health"),
     "GHLTH": ("Fair or poor general health", "health"),
 }
-
-
-def db_engine() -> Engine:
-    load_dotenv(ROOT / ".env", override=False)
-
-    target_database = get_target_database()
-    if os.getenv("POSTGRES_DB") != target_database:
-        raise RuntimeError(
-            f"Conexión rechazada: POSTGRES_DB debe ser {target_database}."
-        )
-
-    if os.getenv("POSTGRES_HOST") != "localhost":
-        raise RuntimeError(
-            "Conexión rechazada: POSTGRES_HOST debe ser localhost."
-        )
-
-    if int(os.getenv("POSTGRES_PORT", "0")) != 5432:
-        raise RuntimeError(
-            "Conexión rechazada: POSTGRES_PORT debe ser 5432."
-        )
-
-    required = ["POSTGRES_USER", "POSTGRES_PASSWORD"]
-    missing = [key for key in required if not os.getenv(key)]
-
-    if missing:
-        raise RuntimeError(
-            f"Faltan variables PostgreSQL: {', '.join(missing)}"
-        )
-
-    url = URL.create(
-        "postgresql+psycopg",
-        username=os.getenv("POSTGRES_USER"),
-        password=os.getenv("POSTGRES_PASSWORD"),
-        host="localhost",
-        port=5432,
-        database=target_database,
-    )
-
-    engine = create_engine(url, pool_pre_ping=True)
-
-    try:
-        with engine.connect() as conn:
-            actual_database = conn.execute(
-                text("SELECT current_database()")
-            ).scalar_one()
-
-            if actual_database != target_database:
-                raise RuntimeError(
-                    f"Base de datos inesperada: {actual_database!r}"
-                )
-
-        return engine
-
-    except Exception:
-        engine.dispose()
-        raise
 
 
 def clean_label(value: str) -> str:
@@ -556,7 +499,7 @@ def upsert_catalog(
         conn.execute(
             text(
                 """
-                INSERT INTO public.silver_source
+                INSERT INTO silver.silver_source
                     (
                         source_code,
                         source_name,
@@ -593,7 +536,7 @@ def upsert_catalog(
                 text(
                     """
                     SELECT source_code, source_id
-                    FROM public.silver_source
+                    FROM silver.silver_source
                     """
                 )
             ).all()
@@ -612,7 +555,7 @@ def upsert_catalog(
         conn.execute(
             text(
                 """
-                INSERT INTO public.silver_health_indicator
+                INSERT INTO silver.silver_health_indicator
                     (
                         source_code,
                         indicator_name,
@@ -641,12 +584,12 @@ def upsert_catalog(
         )
 
         source_count = conn.execute(
-            text("SELECT COUNT(*) FROM public.silver_source")
+            text("SELECT COUNT(*) FROM silver.silver_source")
         ).scalar_one()
 
         indicator_count = conn.execute(
             text(
-                "SELECT COUNT(*) FROM public.silver_health_indicator"
+                "SELECT COUNT(*) FROM silver.silver_health_indicator"
             )
         ).scalar_one()
 
@@ -681,7 +624,7 @@ def main() -> int:
         len(indicators),
     )
 
-    engine = db_engine()
+    engine = create_database_engine()
 
     try:
         source_count, indicator_count = upsert_catalog(

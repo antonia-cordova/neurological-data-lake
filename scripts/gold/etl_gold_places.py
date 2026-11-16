@@ -1,5 +1,5 @@
-﻿from __future__ import annotations
-from scripts.gold.db_connection import create_gold_engine
+from __future__ import annotations
+from scripts.database_connection import create_database_engine as _create_database_engine
 from scripts.database_config import get_target_database
 import argparse
 from contextlib import contextmanager, nullcontext
@@ -60,9 +60,8 @@ logging.basicConfig(
 logger = logging.getLogger("etl_gold_places")
 
 
-
-def create_db_engine() -> Engine:
-    return create_gold_engine()
+def create_database_engine() -> Engine:
+    return _create_database_engine()
 
 
 def resolve_source_run_id(
@@ -99,7 +98,7 @@ def validate_source_run(conn, source_run_id: int) -> dict:
                 loaded_rows,
                 status,
                 finished_at
-            FROM public.etl_runs
+            FROM datalake_control.etl_runs
             WHERE run_id = :run_id
         """),
         {"run_id": source_run_id},
@@ -140,7 +139,7 @@ def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
     # Evitar que otra ejecución ETL reemplace Silver
     # mientras Gold valida y consume los registros.
     conn.execute(text("""
-        LOCK TABLE public.silver_places_2023 IN SHARE MODE
+        LOCK TABLE silver.silver_places_2023 IN SHARE MODE
     """))
 
     # VALIDAR TRAZABILIDAD DE SILVER
@@ -153,7 +152,7 @@ def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
                 COUNT(DISTINCT run_id) AS distinct_runs,
                 MIN(run_id) AS min_run_id,
                 MAX(run_id) AS max_run_id
-            FROM public.silver_places_2023
+            FROM silver.silver_places_2023
             WHERE run_id = :run_id
         """),
         {"run_id": expected_run_id},
@@ -188,7 +187,7 @@ def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
                 latitude,
                 longitude,
                 reference_year
-            FROM public.silver_places_2023
+            FROM silver.silver_places_2023
             WHERE run_id = :run_id
             ORDER BY location_id, measure_id, data_value_type
         """),
@@ -763,7 +762,7 @@ def validate_orchestrator_lock(engine: Engine) -> None:
 @contextmanager
 def acquire_places_execution_lock():
     """Serializa PLACES independiente frente al pipeline Gold completo."""
-    engine = create_db_engine()
+    engine = create_database_engine()
     conn = None
     acquired = False
 
@@ -812,7 +811,7 @@ def run_etl(
     source_run_id: int | None = None,
     orchestrated: bool = False,
 ) -> None:
-    engine = create_db_engine()
+    engine = create_database_engine()
 
     try:
         if orchestrated:

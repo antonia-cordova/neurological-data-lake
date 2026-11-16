@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import logging
@@ -6,7 +6,7 @@ import re
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from scripts.gold.db_connection import create_gold_engine
+from scripts.database_connection import create_database_engine
 from scripts.gold.silver_run_validator import resolve_single_silver_run_id
 from sqlalchemy import text
 
@@ -71,7 +71,7 @@ def validate_source_run(conn, source_run_id: int) -> dict:
                 source_rows,
                 loaded_rows,
                 status
-            FROM public.etl_runs
+            FROM datalake_control.etl_runs
             WHERE run_id = :run_id
         """),
         {"run_id": source_run_id},
@@ -159,7 +159,7 @@ def read_and_validate_silver(
 ) -> list[dict]:
 
     conn.execute(text("""
-        LOCK TABLE public.silver_acs_county_2024 IN SHARE MODE
+        LOCK TABLE silver.silver_acs_county_2024 IN SHARE MODE
     """))
 
     lineage = conn.execute(
@@ -172,7 +172,7 @@ def read_and_validate_silver(
                 MAX(run_id) AS max_run_id,
                 COUNT(DISTINCT geography_id) AS geographies,
                 COUNT(DISTINCT variable_code) AS variables
-            FROM public.silver_acs_county_2024
+            FROM silver.silver_acs_county_2024
             WHERE run_id = :run_id
         """),
         {"run_id": source_run_id},
@@ -207,7 +207,7 @@ def read_and_validate_silver(
                 s.run_id,
                 g.geography_key,
                 st.geography_key AS parent_state_key
-            FROM public.silver_acs_county_2024 s
+            FROM silver.silver_acs_county_2024 s
             LEFT JOIN gold.dim_geography g
                 ON g.location_id = s.geography_id
                AND g.geography_level = 'COUNTY'
@@ -453,7 +453,7 @@ def load_facts(
 
 
 def run_etl(source_run_id: int | None = None) -> None:
-    engine = create_gold_engine()
+    engine = create_database_engine()
 
     try:
         with engine.begin() as conn:

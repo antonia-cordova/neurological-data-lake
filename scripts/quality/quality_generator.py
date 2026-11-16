@@ -21,14 +21,14 @@ EXPECTED = {
 ("gold","dim_prevalence_type"),("gold","dim_source"),
 ("gold","fact_acs_county_indicator"),("gold","fact_acs_indicator"),
 ("gold","fact_area_health"),("gold","fact_brfss_response"),
-("gold","fact_health_integrated"),("public","etl_runs"),
-("public","silver_acs_2024"),("public","silver_acs_county_2024"),
-("public","silver_brfss_2023"),("public","silver_places_2023")}
+("gold","fact_health_integrated"),("datalake_control","etl_runs"),
+("silver","silver_acs_2024"),("silver","silver_acs_county_2024"),
+("silver","silver_brfss_2023"),("silver","silver_places_2023")}
 
 NUMERIC_RULES = [
 ("gold","fact_area_health","data_value","percent"),
 ("gold","fact_health_integrated","value_numeric","percent"),
-("public","silver_places_2023","data_value","percent"),
+("silver","silver_places_2023","data_value","percent"),
 ("gold","fact_acs_indicator","estimate_numeric","positive"),
 ("gold","fact_acs_indicator","percent_numeric","percent"),
 ("gold","fact_acs_indicator","margin_of_error_numeric","positive"),
@@ -40,8 +40,8 @@ NUMERIC_RULES = [
 ("gold","fact_brfss_response","numeric_value","brfss"),
 ("gold","dim_geography","latitude","latitude"),
 ("gold","dim_geography","longitude","longitude"),
-("public","silver_places_2023","latitude","latitude"),
-("public","silver_places_2023","longitude","longitude")]
+("silver","silver_places_2023","latitude","latitude"),
+("silver","silver_places_2023","longitude","longitude")]
 
 TEXT_RULES = [
 ("gold","bridge_health_indicator_source","relation_type",["DIRECT","CONCEPTUAL","PARTIAL"]),
@@ -63,9 +63,9 @@ NULL_RULES = [
 ("gold","fact_brfss_response","raw_value"),
 ("gold","fact_health_integrated","value_numeric"),
 ("gold","fact_health_integrated","value_raw"),
-("public","silver_acs_2024","estimate"),
-("public","silver_acs_county_2024","estimate"),
-("public","silver_places_2023","data_value")]
+("silver","silver_acs_2024","estimate"),
+("silver","silver_acs_county_2024","estimate"),
+("silver","silver_places_2023","data_value")]
 
 INDICATOR_TO_MEASURE = {
 "ARTHRITIS":"ARTHRITIS","CORONARY_HEART_DISEASE":"CHD","DEPRESSION":"DEPRESSION",
@@ -155,10 +155,13 @@ def verify_scenario_metadata(c, level, lock=False):
 def qt(s,t): return sql.SQL(".").join([sql.Identifier(s),sql.Identifier(t)])
 def inventory(c):
     return set(c.execute("""SELECT table_schema,table_name FROM information_schema.tables
-    WHERE table_type='BASE TABLE' AND table_schema IN ('public','gold')""").fetchall())
+    WHERE table_type = 'BASE TABLE'
+      AND table_schema IN ('silver', 'gold', 'datalake_control')""").fetchall())
+
 def colinfo(c,s,t):
     return {r[0]:r[1] for r in c.execute("""SELECT column_name,is_nullable FROM information_schema.columns
     WHERE table_schema=%s AND table_name=%s""",(s,t)).fetchall()}
+
 def pkcols(c,s,t):
     return [r[0] for r in c.execute("""SELECT a.attname FROM pg_index i
     JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace
@@ -500,14 +503,14 @@ def apply_changes(c,changes):
             )
 
 def constraint_report(c):
-    """Devuelve las restricciones declarativas de public y gold."""
+    """Devuelve las restricciones declarativas de silver y gold."""
     return c.execute("""
         SELECT n.nspname,t.relname,con.conname,con.contype,
                pg_get_constraintdef(con.oid,true),con.convalidated
         FROM pg_constraint con
         JOIN pg_class t ON t.oid=con.conrelid
         JOIN pg_namespace n ON n.oid=t.relnamespace
-        WHERE n.nspname IN ('public','gold')
+        WHERE n.nspname IN ('silver', 'gold', 'datalake_control')
         ORDER BY n.nspname,t.relname,con.contype,con.conname
     """).fetchall()
 
@@ -522,7 +525,8 @@ def validate_constraints(c):
     not_null=c.execute("""
         SELECT table_schema,table_name,column_name
         FROM information_schema.columns
-        WHERE table_schema IN ('public','gold') AND is_nullable='NO'
+        WHERE table_schema IN ('silver', 'gold', 'datalake_control')
+        AND is_nullable = 'NO'
         ORDER BY table_schema,table_name,ordinal_position
     """).fetchall()
     return len(constraints),len(not_null)
@@ -615,7 +619,7 @@ def recover_ground_truth(level):
                 schema_name = row["schema"]
                 table_name = row["table"]
                 column_name = row["column"]
-                if schema_name not in {"public", "gold"}:
+                if schema_name not in {"silver", "gold", "datalake_control"}:
                     raise RuntimeError(
                         f"Esquema no permitido en CSV, línea {line_number}: {schema_name!r}."
                     )

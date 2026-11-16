@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager, nullcontext
@@ -7,7 +7,7 @@ import re
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from scripts.gold.db_connection import create_gold_engine
+from scripts.database_connection import create_database_engine
 from scripts.database_config import get_target_database
 from scripts.gold.silver_run_validator import resolve_single_silver_run_id
 from sqlalchemy import text
@@ -71,7 +71,7 @@ def validate_source_run(conn, source_run_id: int) -> dict:
                 source_rows,
                 loaded_rows,
                 status
-            FROM public.etl_runs
+            FROM datalake_control.etl_runs
             WHERE run_id = :run_id
         """),
         {"run_id": source_run_id},
@@ -199,7 +199,7 @@ def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
 
     # Evitar cambios concurrentes en Silver durante la lectura.
     conn.execute(text("""
-        LOCK TABLE public.silver_acs_2024 IN SHARE MODE
+        LOCK TABLE silver.silver_acs_2024 IN SHARE MODE
     """))
 
     
@@ -215,7 +215,7 @@ def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
                     WHERE estimate IS NOT NULL
                       AND BTRIM(estimate) <> ''
                 ) AS rows_with_estimate
-            FROM public.silver_acs_2024
+            FROM silver.silver_acs_2024
             WHERE run_id = :run_id
         """),
         {"run_id": run_id},
@@ -244,7 +244,7 @@ def read_and_validate_silver(conn, source_run: dict) -> list[dict]:
                 percent,
                 percent_margin_of_error,
                 run_id
-            FROM public.silver_acs_2024
+            FROM silver.silver_acs_2024
             WHERE run_id = :run_id
             ORDER BY acs_row_id
         """),
@@ -696,7 +696,7 @@ def validate_orchestrator_lock(engine) -> None:
 @contextmanager
 def acquire_acs_execution_lock():
     """Serializa ACS independiente frente al pipeline Gold completo."""
-    engine = create_gold_engine()
+    engine = create_database_engine()
     conn = None
     acquired = False
 
@@ -751,7 +751,7 @@ def run_etl(
     source_run_id: int | None = None,
     orchestrated: bool = False,
 ):
-    engine = create_gold_engine()
+    engine = create_database_engine()
 
     try:
         if orchestrated:

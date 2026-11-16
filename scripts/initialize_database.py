@@ -8,7 +8,6 @@ import psycopg
 from psycopg import sql
 from dotenv import load_dotenv
 
-
 from scripts.database_config import SCENARIOS, database_for_scenario, get_target_database
 from scripts.bronze.parquet_io import validate_dataset_manifest
 
@@ -17,7 +16,6 @@ ROOT = Path(__file__).resolve().parents[1]
 ALLOWED_HOST = "localhost"
 ALLOWED_PORT = 5432
 
-# Fuentes únicas para la creación de estructuras.
 SCHEMA_FILES = [
     ROOT / "sql" / "silver" / "schema_silver.sql",
     ROOT / "sql" / "gold" / "schema_gold.sql",
@@ -56,10 +54,14 @@ GOLD_TABLES = [
 ]
 
 EXPECTED_TABLES = {
-    *(("public", name) for name in SILVER_TABLES + AUDIT_TABLES),
+    *(("silver", name) for name in SILVER_TABLES),
+    ("datalake_control", "etl_runs"),
+    ("datalake_control", "ingestion_batches"),
+    ("datalake_control", "scenario_metadata"),
     *(("gold", name) for name in GOLD_TABLES),
 }
-EXPECTED_TABLE_COUNT = 27
+
+EXPECTED_TABLE_COUNT = 29
 
 
 def get_admin_connection():
@@ -115,7 +117,12 @@ def get_existing_tables(conn) -> set[tuple[str, str]]:
             """
             SELECT table_schema, table_name
             FROM information_schema.tables
-            WHERE table_schema IN ('public', 'gold')
+           WHERE table_schema IN (
+                'public',
+                'silver',
+                'gold',
+                'datalake_control'
+            )
               AND table_type = 'BASE TABLE'
             ORDER BY table_schema, table_name
             """
@@ -224,8 +231,8 @@ def read_schema(path: Path) -> str:
 
     lines = []
     for line in path.read_text(encoding="utf-8").splitlines():
-        # Ambos archivos se ejecutan dentro de una única transacción
-        # administrada por este inicializador.
+        # abos archivos se ejecutan dentro de una única transacción
+        # administrada por este inicializador
         if line.strip().upper() in ("BEGIN;", "COMMIT;"):
             continue
         lines.append(line)
@@ -289,7 +296,7 @@ def main() -> int:
             raise RuntimeError(
                 f"La base {database} ya contiene tablas. No se sobrescribirá."
             )
-        # Las consultas de inspección abrieron una transacción implícita.
+        #  consultas de inspección abrieron una transacción implícita
         # Se confirma antes de iniciar la transacción atómica de los esquemas.
         conn.commit()
         with conn.transaction():

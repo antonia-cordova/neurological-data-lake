@@ -1,12 +1,18 @@
-CREATE TABLE IF NOT EXISTS public.etl_runs (
+CREATE SCHEMA IF NOT EXISTS datalake_control;
+CREATE SCHEMA IF NOT EXISTS silver;
+
+-- ============================================================
+-- CONTROL: ETL RUNS
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS datalake_control.etl_runs (
     run_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     dataset_name TEXT NOT NULL,
     target_table TEXT NOT NULL,
     started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     finished_at TIMESTAMPTZ,
-    status TEXT NOT NULL DEFAULT 'running'
-        CHECK (status IN ('running', 'succeeded', 'failed', 'partial')),
-    source_rows BIGINT CHECK (source_rows IS NULL OR source_rows >= 0),
+    status TEXT NOT NULL DEFAULT 'running',
+    source_rows BIGINT NOT NULL DEFAULT 0 CHECK (source_rows >= 0),
     loaded_rows BIGINT NOT NULL DEFAULT 0 CHECK (loaded_rows >= 0),
     error_message TEXT,
     CONSTRAINT etl_runs_finished_after_started
@@ -14,17 +20,17 @@ CREATE TABLE IF NOT EXISTS public.etl_runs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_etl_runs_dataset_started
-    ON public.etl_runs (dataset_name, started_at DESC);
+    ON datalake_control.etl_runs (dataset_name, started_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_etl_runs_status
-    ON public.etl_runs (status);
+    ON datalake_control.etl_runs (status);
 
 -- ============================================================
 -- PLACES 2023
 -- 11 physical columns
 -- ============================================================
 
-CREATE TABLE IF NOT EXISTS public.silver_places_2023 (
+CREATE TABLE IF NOT EXISTS silver.silver_places_2023 (
     state_abbr TEXT,
     location_name TEXT,
     location_id TEXT NOT NULL,
@@ -36,7 +42,7 @@ CREATE TABLE IF NOT EXISTS public.silver_places_2023 (
     longitude DOUBLE PRECISION,
     reference_year SMALLINT NOT NULL,
     run_id BIGINT NOT NULL
-        REFERENCES public.etl_runs(run_id),
+        REFERENCES datalake_control.etl_runs(run_id),
 
     CONSTRAINT silver_places_2023_reference_year_check
         CHECK (reference_year BETWEEN 1900 AND 2100),
@@ -46,16 +52,16 @@ CREATE TABLE IF NOT EXISTS public.silver_places_2023 (
 );
 
 CREATE INDEX IF NOT EXISTS idx_silver_places_2023_location
-    ON public.silver_places_2023 (location_id);
+    ON silver.silver_places_2023 (location_id);
 
 CREATE INDEX IF NOT EXISTS idx_silver_places_2023_measure
-    ON public.silver_places_2023 (measure_id);
+    ON silver.silver_places_2023 (measure_id);
 
 CREATE INDEX IF NOT EXISTS idx_silver_places_2023_run_id
-    ON public.silver_places_2023 (run_id);
+    ON silver.silver_places_2023 (run_id);
 
 CREATE INDEX IF NOT EXISTS idx_silver_places_2023_reference_year
-    ON public.silver_places_2023 (reference_year);
+    ON silver.silver_places_2023 (reference_year);
 
 
 -- ============================================================
@@ -65,12 +71,12 @@ CREATE INDEX IF NOT EXISTS idx_silver_places_2023_reference_year
 -- silver_brfss_2023  : one response row per respondent (1:1).
 -- ============================================================
 
-CREATE TABLE IF NOT EXISTS public.silver_respondent (
+CREATE TABLE IF NOT EXISTS silver.silver_respondent (
     respondent_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     sequence_number TEXT NOT NULL,
     state_fips VARCHAR(2) NOT NULL,
     run_id BIGINT NOT NULL
-        REFERENCES public.etl_runs(run_id),
+        REFERENCES datalake_control.etl_runs(run_id),
 
     CONSTRAINT ck_silver_respondent_state_fips
         CHECK (state_fips ~ '^[0-9]{2}$'),
@@ -79,11 +85,11 @@ CREATE TABLE IF NOT EXISTS public.silver_respondent (
 );
 
 CREATE INDEX IF NOT EXISTS ix_silver_respondent_run_id
-    ON public.silver_respondent (run_id);
+    ON silver.silver_respondent (run_id);
 
-CREATE TABLE IF NOT EXISTS public.silver_brfss_2023 (
+CREATE TABLE IF NOT EXISTS silver.silver_brfss_2023 (
     respondent_id BIGINT PRIMARY KEY
-        REFERENCES public.silver_respondent(respondent_id)
+        REFERENCES silver.silver_respondent(respondent_id)
         ON UPDATE RESTRICT ON DELETE CASCADE,
     record_data JSONB NOT NULL,
     CONSTRAINT ck_silver_brfss_record_data_object
@@ -91,14 +97,14 @@ CREATE TABLE IF NOT EXISTS public.silver_brfss_2023 (
 );
 
 CREATE INDEX IF NOT EXISTS idx_silver_brfss_2023_record_data
-    ON public.silver_brfss_2023 USING GIN (record_data);
+    ON silver.silver_brfss_2023 USING GIN (record_data);
 
 -- ============================================================
 -- ACS 2024
 -- 7 physical columns
 -- ============================================================
 
-CREATE TABLE IF NOT EXISTS public.silver_acs_2024 (
+CREATE TABLE IF NOT EXISTS silver.silver_acs_2024 (
     acs_row_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     label_grouping TEXT NOT NULL,
     estimate TEXT,
@@ -106,14 +112,14 @@ CREATE TABLE IF NOT EXISTS public.silver_acs_2024 (
     percent TEXT,
     percent_margin_of_error TEXT,
     run_id BIGINT NOT NULL
-        REFERENCES public.etl_runs(run_id)
+        REFERENCES datalake_control.etl_runs(run_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_silver_acs_2024_label
-    ON public.silver_acs_2024 (label_grouping);
+    ON silver.silver_acs_2024 (label_grouping);
 
 CREATE INDEX IF NOT EXISTS idx_silver_acs_2024_run_id
-    ON public.silver_acs_2024 (run_id);
+    ON silver.silver_acs_2024 (run_id);
 
     
 -- ============================================================
@@ -122,7 +128,7 @@ CREATE INDEX IF NOT EXISTS idx_silver_acs_2024_run_id
 -- ETL  is preserved through run_id.
 -- ============================================================
 
-CREATE TABLE IF NOT EXISTS public.silver_acs_county_2024 (
+CREATE TABLE IF NOT EXISTS silver.silver_acs_county_2024 (
     acs_county_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     state_fips TEXT NOT NULL,
     county_fips TEXT NOT NULL,
@@ -134,7 +140,7 @@ CREATE TABLE IF NOT EXISTS public.silver_acs_county_2024 (
     percent TEXT,
     percent_margin_of_error TEXT,
     run_id BIGINT NOT NULL
-        REFERENCES public.etl_runs(run_id),
+        REFERENCES datalake_control.etl_runs(run_id),
 
     CONSTRAINT ck_acs_county_state_fips
         CHECK (state_fips ~ '^[0-9]{2}$'),
@@ -158,29 +164,29 @@ CREATE TABLE IF NOT EXISTS public.silver_acs_county_2024 (
 );
 
 CREATE INDEX IF NOT EXISTS ix_silver_acs_county_run
-    ON public.silver_acs_county_2024 (run_id);
+    ON silver.silver_acs_county_2024 (run_id);
 
 CREATE INDEX IF NOT EXISTS ix_silver_acs_county_variable
-    ON public.silver_acs_county_2024 (variable_code);
+    ON silver.silver_acs_county_2024 (variable_code);
 
-COMMENT ON TABLE public.silver_acs_county_2024 IS
+COMMENT ON TABLE silver.silver_acs_county_2024 IS
     'ACS 2024 5-Year Data Profiles DP05 at county level. One current record per county and variable, with ETL run-level lineage.';
 
-COMMENT ON COLUMN public.silver_acs_county_2024.geography_id IS
+COMMENT ON COLUMN silver.silver_acs_county_2024.geography_id IS
     'Five-digit Census FIPS code composed of state FIPS and county FIPS.';
 
-COMMENT ON COLUMN public.silver_acs_county_2024.variable_code IS
+COMMENT ON COLUMN silver.silver_acs_county_2024.variable_code IS
     'ACS DP05 variable identifier. Four selected demographic indicators.';
 
-COMMENT ON COLUMN public.silver_acs_county_2024.run_id IS
-    'ETL execution identifier referencing public.etl_runs.';
+COMMENT ON COLUMN silver.silver_acs_county_2024.run_id IS
+    'ETL execution identifier referencing datalake_control.etl_runs.';
 
 -- ============================================================
 -- SOURCE CATALOG
 -- Reference table: excluded from analytical Silver cell budget.
 -- ============================================================
 
-CREATE TABLE IF NOT EXISTS public.silver_source (
+CREATE TABLE IF NOT EXISTS silver.silver_source (
     source_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     source_code TEXT NOT NULL,
     source_name TEXT NOT NULL,
@@ -207,10 +213,10 @@ CREATE TABLE IF NOT EXISTS public.silver_source (
 );
 
 CREATE INDEX IF NOT EXISTS ix_silver_source_dataset_name
-    ON public.silver_source (dataset_name);
+    ON silver.silver_source (dataset_name);
 
 CREATE INDEX IF NOT EXISTS ix_silver_source_release_year
-    ON public.silver_source (release_year);
+    ON silver.silver_source (release_year);
 
 
 -- ============================================================
@@ -219,7 +225,7 @@ CREATE INDEX IF NOT EXISTS ix_silver_source_release_year
 -- Reference table: excluded from analytical Silver cell budget.
 -- ============================================================
 
-CREATE TABLE IF NOT EXISTS public.silver_health_indicator (
+CREATE TABLE IF NOT EXISTS silver.silver_health_indicator (
     indicator_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     source_code TEXT NOT NULL,
     indicator_name TEXT NOT NULL,
@@ -227,7 +233,7 @@ CREATE TABLE IF NOT EXISTS public.silver_health_indicator (
     unit TEXT,
     value_type TEXT,
     source_id BIGINT NOT NULL
-        REFERENCES public.silver_source(source_id)
+        REFERENCES silver.silver_source(source_id)
         ON UPDATE RESTRICT ON DELETE RESTRICT,
 
     CONSTRAINT ck_silver_health_indicator_category
@@ -248,41 +254,41 @@ CREATE TABLE IF NOT EXISTS public.silver_health_indicator (
 );
 
 CREATE INDEX IF NOT EXISTS ix_silver_health_indicator_source_id
-    ON public.silver_health_indicator (source_id);
+    ON silver.silver_health_indicator (source_id);
 
 CREATE INDEX IF NOT EXISTS ix_silver_health_indicator_category
-    ON public.silver_health_indicator (indicator_category);
+    ON silver.silver_health_indicator (indicator_category);
 
 
 -- ============================================================
 -- DOCUMENTATION
 -- ============================================================
 
-COMMENT ON TABLE public.etl_runs IS
+COMMENT ON TABLE datalake_control.etl_runs IS
     'Audit log for dataset ETL executions. One row per execution.';
 
-COMMENT ON TABLE public.silver_places_2023 IS
+COMMENT ON TABLE silver.silver_places_2023 IS
     'Compact PLACES Silver dataset filtered to reference year 2023, with ETL run-level lineage.';
 
-COMMENT ON COLUMN public.silver_places_2023.reference_year IS
+COMMENT ON COLUMN silver.silver_places_2023.reference_year IS
     'Observation reference year preserved from the original Bronze Year column.';
 
-COMMENT ON TABLE public.silver_respondent IS
+COMMENT ON TABLE silver.silver_respondent IS
     'BRFSS 2023 respondent identity dimension. One row per sampled respondent, with state FIPS and ETL lineage.';
 
-COMMENT ON COLUMN public.silver_respondent.sequence_number IS
+COMMENT ON COLUMN silver.silver_respondent.sequence_number IS
     'Original BRFSS SEQNO identifier, preserved as text.';
 
-COMMENT ON COLUMN public.silver_respondent.state_fips IS
+COMMENT ON COLUMN silver.silver_respondent.state_fips IS
     'Two-digit state FIPS derived from BRFSS _STATE, preserving leading zeros.';
 
-COMMENT ON COLUMN public.silver_respondent.run_id IS
+COMMENT ON COLUMN silver.silver_respondent.run_id IS
     'ETL execution that most recently loaded this respondent.';
 
-COMMENT ON TABLE public.silver_brfss_2023 IS
+COMMENT ON TABLE silver.silver_brfss_2023 IS
     'BRFSS 2023 analytical responses. One row per silver_respondent, linked by respondent_id; selected variables stored in JSONB.';
 
-COMMENT ON TABLE public.silver_acs_2024 IS
+COMMENT ON TABLE silver.silver_acs_2024 IS
     'ACS 2024 DP05 five-year estimates. Text values preserve source markers.';
 
 -- ============================================================
@@ -290,12 +296,12 @@ COMMENT ON TABLE public.silver_acs_2024 IS
 -- Reference dimensions; excluded from analytical Silver cell budget.
 -- ============================================================
 
-CREATE TABLE IF NOT EXISTS public.silver_geography (
+CREATE TABLE IF NOT EXISTS silver.silver_geography (
     geography_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     geography_level VARCHAR(10) NOT NULL,
     geography_code VARCHAR(5) NOT NULL,
     geography_name VARCHAR(150) NOT NULL,
-    parent_geography_id BIGINT REFERENCES public.silver_geography(geography_id)
+    parent_geography_id BIGINT REFERENCES silver.silver_geography(geography_id)
         ON UPDATE RESTRICT ON DELETE RESTRICT,
     latitude NUMERIC(10,7),
     longitude NUMERIC(10,7),
@@ -320,13 +326,13 @@ CREATE TABLE IF NOT EXISTS public.silver_geography (
 );
 
 CREATE INDEX IF NOT EXISTS ix_silver_geography_parent
-    ON public.silver_geography (parent_geography_id);
+    ON silver.silver_geography (parent_geography_id);
 CREATE INDEX IF NOT EXISTS ix_silver_geography_level
-    ON public.silver_geography (geography_level);
+    ON silver.silver_geography (geography_level);
 
-CREATE TABLE IF NOT EXISTS public.silver_county (
+CREATE TABLE IF NOT EXISTS silver.silver_county (
     geography_id BIGINT PRIMARY KEY
-        REFERENCES public.silver_geography(geography_id)
+        REFERENCES silver.silver_geography(geography_id)
         ON UPDATE RESTRICT ON DELETE RESTRICT,
     state_fips VARCHAR(2) NOT NULL,
     county_fips VARCHAR(3) NOT NULL,
@@ -338,28 +344,28 @@ CREATE TABLE IF NOT EXISTS public.silver_county (
 );
 
 CREATE INDEX IF NOT EXISTS ix_silver_county_state_fips
-    ON public.silver_county (state_fips);
+    ON silver.silver_county (state_fips);
 
-COMMENT ON TABLE public.silver_geography IS
+COMMENT ON TABLE silver.silver_geography IS
     'Geographic reference catalogue for state and county FIPS units. One row per geography level and normalized FIPS code.';
-COMMENT ON COLUMN public.silver_geography.geography_code IS
+COMMENT ON COLUMN silver.silver_geography.geography_code IS
     'FIPS stored as text to preserve leading zeros: 2 digits for STATE and 5 digits for COUNTY.';
-COMMENT ON COLUMN public.silver_geography.parent_geography_id IS
+COMMENT ON COLUMN silver.silver_geography.parent_geography_id IS
     'Self-reference to the parent geography. NULL for states; county rows reference their state.';
-COMMENT ON TABLE public.silver_county IS
+COMMENT ON TABLE silver.silver_county IS
     'County-specific attributes linked one-to-one to silver_geography through geography_id.';
-COMMENT ON COLUMN public.silver_county.geography_id IS
+COMMENT ON COLUMN silver.silver_county.geography_id IS
     'Primary key and foreign key to the corresponding COUNTY row in silver_geography.';
 
 
-COMMENT ON TABLE public.silver_source IS
+COMMENT ON TABLE silver.silver_source IS
     'Silver source catalog. Release year identifies the published dataset edition; optional reference period identifies the observation period.';
-COMMENT ON COLUMN public.silver_source.release_year IS
+COMMENT ON COLUMN silver.silver_source.release_year IS
     'Publication/release year of the dataset edition, not necessarily the observation year.';
-COMMENT ON TABLE public.silver_health_indicator IS
+COMMENT ON TABLE silver.silver_health_indicator IS
     'Source-level indicator catalog. One record per source and original variable/measure code; independent from Gold dimensions.';
-COMMENT ON COLUMN public.silver_health_indicator.source_code IS
+COMMENT ON COLUMN silver.silver_health_indicator.source_code IS
     'Original variable or measure identifier from the source, without estimate/MOE suffixes.';
-COMMENT ON COLUMN public.silver_health_indicator.indicator_category IS
+COMMENT ON COLUMN silver.silver_health_indicator.indicator_category IS
     'Controlled classification: health, demographic, socioeconomic, or health_risk.';
 
