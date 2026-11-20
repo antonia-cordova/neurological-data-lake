@@ -464,10 +464,11 @@ def plan_places_reference_year(c, cfg, level, rate, minimum, rng, reserved):
 
 
 def plan_places_health_measure_semantics(c, cfg, level, rate, minimum, rng, reserved):
-    """
-    Sustituye health_measure_key por otra clave existente del diccionario.
-    La alternativa conserva la FK, pero representa otra medida de salud.
-    Se comprueba la PK compuesta antes de guardar cada cambio.
+    """Planifica intercambios por pares de health_measure_key en PLACES.
+
+    Cada par pertenece al mismo (source_run_id, geography_key,
+    prevalence_type_key). Se intercambian dos claves ya existentes, por lo
+    que se conservan el conjunto de claves, las FK y la PK compuesta.
     """
     rows = c.execute("""
         SELECT f.source_run_id, f.geography_key, f.health_measure_key,
@@ -476,6 +477,8 @@ def plan_places_health_measure_semantics(c, cfg, level, rate, minimum, rng, rese
         JOIN gold.dim_source s ON s.source_key = f.source_key
         WHERE s.source_code = 'PLACES'
           AND f.health_measure_key IS NOT NULL
+        ORDER BY f.source_run_id, f.geography_key,
+                 f.prevalence_type_key, f.health_measure_key
     """).fetchall()
 
     measures = c.execute("""
@@ -483,86 +486,78 @@ def plan_places_health_measure_semantics(c, cfg, level, rate, minimum, rng, rese
         FROM gold.dim_health_measure
         ORDER BY health_measure_key
     """).fetchall()
-    valid_keys = [row[0] for row in measures]
-    valid_key_set = set(valid_keys)
-
-    invalid_existing = sorted({
-        row[2] for row in rows if row[2] not in valid_key_set
-    })
+    valid_key_set = {row[0] for row in measures}
+    invalid_existing = sorted({row[2] for row in rows if row[2] not in valid_key_set})
     if invalid_existing:
         raise RuntimeError(
             "fact_area_health contiene health_measure_key fuera del diccionario: "
             f"{invalid_existing}"
         )
 
-    rows = [
-        row for row in rows
-        if ("gold", "fact_area_health",
-            (row[0], row[1], row[2], row[3]), "health_measure_key") not in reserved
-    ]
+    groups = {}
+    for run_id, geography_key, measure_key, prevalence_key in rows:
+        pk = (run_id, geography_key, measure_key, prevalence_key)
+        if ("gold", "fact_area_health", pk, "health_measure_key") in reserved:
+            continue
+        group = (run_id, geography_key, prevalence_key)
+        groups.setdefault(group, []).append(measure_key)
 
-    # La PK es (source_run_id, geography_key, health_measure_key, prevalence_type_key)
-    occupied = {
-        (row[0], row[1], row[2], row[3])
-        for row in c.execute("""
-            SELECT source_run_id, geography_key, health_measure_key,
-                   prevalence_type_key
-            FROM gold.fact_area_health
-        """).fetchall()
-    }
+    eligible_rows = sum(len(keys) for keys in groups.values())
+    target = rate_count(eligible_rows, rate, minimum)
+    # Un intercambio modifica exactamente dos asociaciones. Nunca se crea
+    # un objetivo impar: si el mínimo configurado produce 1, se eleva a 2.
+    if target % 2:
+        target += 1
+    target = min(target, eligible_rows - (eligible_rows % 2))
 
-    target = rate_count(len(rows), rate, minimum)
-    candidates = rng.sample(rows, len(rows))
+    candidates = list(groups.items())
+    rng.shuffle(candidates)
     changes = []
+    pairs_planned = 0
 
-    for row in candidates:
+    for (run_id, geography_key, prevalence_key), measure_keys in candidates:
         if len(changes) >= target:
             break
-
-        run_id, geography_key, old_key, prevalence_key = row
-        options = [key for key in valid_keys if key != old_key]
-        rng.shuffle(options)
-        selected = None
-
-        for new_key in options:
-            new_pk = (run_id, geography_key, new_key, prevalence_key)
-            if new_pk not in occupied:
-                selected = (new_key, new_pk)
-                break
-
-        if selected is None:
-            continue
-
-        new_key, new_pk = selected
-        old_pk = (run_id, geography_key, old_key, prevalence_key)
-        occupied.discard(old_pk)
-        occupied.add(new_pk)
-
-        changes.append(mkchange(
-            cfg, level, "gold", "fact_area_health",
-            ["source_run_id", "geography_key", "health_measure_key",
-             "prevalence_type_key"],
-            [run_id, geography_key, old_key, prevalence_key],
-            "health_measure_key", old_key, new_key,
-            "fk_valid_semantic_measure_swap", "semantic_consistency"
-        ))
-        reserved.add((
-            "gold", "fact_area_health", old_pk, "health_measure_key"
-        ))
+        available = list(measure_keys)
+        rng.shuffle(available)
+        while len(available) >= 2 and len(changes) < target:
+            key_a = available.pop()
+            key_b = available.pop()
+            if key_a == key_b:
+                continue
+            pk_a = (run_id, geography_key, key_a, prevalence_key)
+            pk_b = (run_id, geography_key, key_b, prevalence_key)
+            changes.append(mkchange(
+                cfg, level, "gold", "fact_area_health",
+                ["source_run_id", "geography_key", "health_measure_key", "prevalence_type_key"],
+                list(pk_a), "health_measure_key", key_a, key_b,
+                "fk_valid_semantic_measure_pair_swap", "semantic_consistency"
+            ))
+            changes.append(mkchange(
+                cfg, level, "gold", "fact_area_health",
+                ["source_run_id", "geography_key", "health_measure_key", "prevalence_type_key"],
+                list(pk_b), "health_measure_key", key_b, key_a,
+                "fk_valid_semantic_measure_pair_swap", "semantic_consistency"
+            ))
+            reserved.add(("gold", "fact_area_health", pk_a, "health_measure_key"))
+            reserved.add(("gold", "fact_area_health", pk_b, "health_measure_key"))
+            pairs_planned += 1
 
     planned = len(changes)
     status = "PLANNED" if planned == target else "PLANNED_PARTIAL"
     reason = "" if status == "PLANNED" else (
-        f"Objetivo: {target}; cambios válidos: {planned}; "
-        "alternativas insuficientes sin colisión en PK compuesta"
+        f"Objetivo: {target} asociaciones ({target // 2} pares); "
+        f"planificadas: {planned} asociaciones ({pairs_planned} pares); "
+        "no hubo suficientes pares elegibles dentro del mismo grupo"
     )
     return changes, dict(
         table="gold.fact_area_health",
         column="health_measure_key",
         dimension="semantic_consistency",
-        eligible=len(rows),
+        eligible=eligible_rows,
         target=target,
         planned=planned,
+        pairs_planned=pairs_planned,
         status=status,
         reason=reason
     )
@@ -639,7 +634,7 @@ def write_reports(level,cfg,changes,reports,counts):
     out=ROOT/"quality"/"reports"; out.mkdir(parents=True,exist_ok=True)
     suffix = "_test" if cfg["database"].endswith("_test") else ""
     rulepath=out/f"quality_dry_run_rules_{level}{suffix}.csv"
-    fields=["table","column","dimension","eligible","target","planned","status","reason"]
+    fields=["table","column","dimension","eligible","target","planned","pairs_planned","status","reason"]
     with rulepath.open("w",newline="",encoding="utf-8-sig") as f:
         w=csv.DictWriter(f,fieldnames=fields); w.writeheader()
         for r in reports: w.writerow({k:r.get(k,"") for k in fields})
@@ -665,32 +660,134 @@ def write_reports(level,cfg,changes,reports,counts):
                 partial_or_skipped_rules=sum(r["status"]!="PLANNED" for r in subset)))
     return rulepath,changepath,summary
 
-def apply_changes(c,changes):
-    """Aplica el plan dentro de la transacción activa y verifica el valor de origen."""
-    for x in changes:
-        keys=list(x.primary_key)
-        vals=tuple(x.primary_key[k] for k in keys)
-        where=sql.SQL(" AND ").join(
-            sql.SQL("{} IS NOT DISTINCT FROM %s").format(sql.Identifier(k))
-            for k in keys
+def _where_pk(keys, vals):
+    return sql.SQL(" AND ").join(
+        sql.SQL("{} IS NOT DISTINCT FROM %s").format(sql.Identifier(k))
+        for k in keys
+    )
+
+
+def _apply_fact_area_health_pair(c, pair):
+    """Aplica un par con delete/insert transaccional, sin desactivar constraints."""
+    if len(pair) != 2:
+        raise RuntimeError("Un pair-swap debe contener exactamente dos cambios.")
+    a, b = pair
+    if a.schema != "gold" or a.table != "fact_area_health" or a.column != "health_measure_key":
+        raise RuntimeError("Pair-swap recibido para una tabla/columna no permitida.")
+    keys_a, keys_b = list(a.primary_key), list(b.primary_key)
+    if keys_a != keys_b or set(keys_a) != {
+        "source_run_id", "geography_key", "health_measure_key", "prevalence_type_key"
+    }:
+        raise RuntimeError("La PK del pair-swap no coincide con la PK compuesta esperada.")
+    if (a.original_value != a.primary_key["health_measure_key"] or
+        b.original_value != b.primary_key["health_measure_key"] or
+        a.altered_value != b.original_value or b.altered_value != a.original_value):
+        raise RuntimeError("El pair-swap no es recíproco o sus valores originales no coinciden.")
+    group_a = (a.primary_key["source_run_id"], a.primary_key["geography_key"], a.primary_key["prevalence_type_key"])
+    group_b = (b.primary_key["source_run_id"], b.primary_key["geography_key"], b.primary_key["prevalence_type_key"])
+    if group_a != group_b:
+        raise RuntimeError("Las dos filas del pair-swap no pertenecen al mismo grupo.")
+
+    table = qt("gold", "fact_area_health")
+    fetched = []
+    for change in pair:
+        keys = list(change.primary_key)
+        vals = tuple(change.primary_key[k] for k in keys)
+        query = sql.SQL("SELECT * FROM {} WHERE {} FOR UPDATE").format(
+            table, _where_pk(keys, vals)
         )
-        
-        where=sql.SQL(" AND ").join([
-            where,
+        cur = c.execute(query, vals)
+        rows = cur.fetchall()
+        if len(rows) != 1:
+            raise RuntimeError(f"Pair-swap: se esperaba una fila, se encontraron {len(rows)}.")
+        column_names = [d.name for d in cur.description]
+        record = dict(zip(column_names, rows[0]))
+        if record.get("health_measure_key") != change.original_value:
+            raise RuntimeError("Pair-swap: el valor original cambió desde la planificación.")
+        fetched.append((change, record))
+
+    # No se omiten ni deshabilitan FK/CHECK/UNIQUE/NOT NULL. Si existen FK
+    # entrantes restrictivas, la eliminación falla y toda la transacción revierte.
+    for change, _record in fetched:
+        keys = list(change.primary_key)
+        vals = tuple(change.primary_key[k] for k in keys)
+        result = c.execute(
+            sql.SQL("DELETE FROM {} WHERE {}").format(table, _where_pk(keys, vals)), vals
+        )
+        if result.rowcount != 1:
+            raise RuntimeError("Pair-swap: no se pudo retirar exactamente una fila.")
+
+    for change, record in fetched:
+        record["health_measure_key"] = change.altered_value
+        # Las columnas generadas siempre las calcula PostgreSQL.
+        generated = c.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema='gold' AND table_name='fact_area_health'
+              AND is_generated='ALWAYS'
+        """).fetchall()
+        generated_names = {r[0] for r in generated}
+        insert_cols = [name for name in record if name not in generated_names]
+        identity_always = c.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema='gold' AND table_name='fact_area_health'
+              AND is_identity='YES' AND identity_generation='ALWAYS'
+        """).fetchall()
+        identity_names = {r[0] for r in identity_always}
+        prefix = sql.SQL(" OVERRIDING SYSTEM VALUE") if identity_names.intersection(insert_cols) else sql.SQL("")
+        query = sql.SQL("INSERT INTO {} ({}){} VALUES ({})").format(
+            table,
+            sql.SQL(",").join(map(sql.Identifier, insert_cols)),
+            prefix,
+            sql.SQL(",").join(sql.Placeholder() for _ in insert_cols)
+        )
+        c.execute(query, [record[name] for name in insert_cols])
+
+
+def apply_changes(c, changes):
+    """Aplica cambios dentro de la transacción activa; pair-swaps como unidad."""
+    pair_groups = {}
+    ordinary = []
+    for change in changes:
+        if change.rule == "fk_valid_semantic_measure_pair_swap":
+            key = (change.schema, change.table, change.rule,
+                   change.primary_key["source_run_id"],
+                   change.primary_key["geography_key"],
+                   change.primary_key["prevalence_type_key"],
+                   tuple(sorted((change.original_value, change.altered_value))))
+            pair_groups.setdefault(key, []).append(change)
+        else:
+            ordinary.append(change)
+
+    # Aplicar primero todos los cambios ordinarios. Algunos usan la PK
+    # original de fact_area_health (por ejemplo data_value y reference_year).
+    # Los pair-swaps cambian health_measure_key, que forma parte de esa PK;
+    # por eso deben ejecutarse al final, cuando ya no quedan cambios ordinarios
+    # pendientes que dependan de las claves originales.
+    for x in ordinary:
+        keys = list(x.primary_key)
+        vals = tuple(x.primary_key[k] for k in keys)
+        where = sql.SQL(" AND ").join([
+            _where_pk(keys, vals),
             sql.SQL("{} IS NOT DISTINCT FROM %s").format(sql.Identifier(x.column))
         ])
-        result=c.execute(
+        result = c.execute(
             sql.SQL("UPDATE {} SET {}=%s WHERE {}").format(
-                qt(x.schema,x.table),sql.Identifier(x.column),where
+                qt(x.schema, x.table), sql.Identifier(x.column), where
             ),
-            [x.altered_value,*vals,x.original_value]
+            [x.altered_value, *vals, x.original_value]
         )
-        if result.rowcount!=1:
+        if result.rowcount != 1:
             raise RuntimeError(
-                f"UPDATE {x.schema}.{x.table}.{x.column}: "
-                f"fila inexistente, valor original distinto o PK no única "
-                f"(rowcount={result.rowcount}, esperado=1)"
+                f"UPDATE {x.schema}.{x.table}.{x.column}: fila inexistente, "
+                f"valor original distinto o PK no única (rowcount={result.rowcount}, esperado=1)"
             )
+
+    # Ejecutar los pair-swaps al final, después de modificar las demás columnas
+    # identificadas mediante la PK original. Cada pareja sigue siendo atómica
+    # dentro de la transacción global y conserva las restricciones declarativas.
+    for pair in pair_groups.values():
+        _apply_fact_area_health_pair(c, pair)
+
 
 def constraint_report(c):
     """Devuelve las restricciones declarativas de silver y gold."""
@@ -739,6 +836,10 @@ def recover_ground_truth(level):
 
     Solo exporta si la base ya está marcada como degraded y cada valor actual
     coincide con el valor alterado registrado en el CSV. No ejecuta UPDATE.
+
+    Las PK originales de las filas afectadas por Pair Swap se traducen a sus
+    PK finales antes de verificar cualquier celda. Esto permite verificar
+    también los cambios ordinarios aplicados a esas mismas filas.
     """
     cfg = load_config(level)
     target = cfg["database"]
@@ -769,6 +870,76 @@ def recover_ground_truth(level):
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError("El resumen de cambios no contiene conteos válidos.") from exc
 
+    with report.open("r", newline="", encoding="utf-8-sig") as stream:
+        reader = csv.DictReader(stream)
+        required = {
+            "database", "level", "schema", "table", "primary_key",
+            "column", "original_value", "altered_value", "rule",
+            "dimension", "seed", "changed_at_utc",
+        }
+        if not required.issubset(set(reader.fieldnames or [])):
+            raise RuntimeError(
+                f"El CSV Ground Truth no contiene las columnas requeridas: "
+                f"{sorted(required - set(reader.fieldnames or []))}."
+            )
+        report_rows = list(reader)
+
+    # Construir primero el mapa PK original -> PK final para todas las filas
+    # movidas por Pair Swap. El CSV contiene dos asociaciones por cada par.
+    pair_key_map = {}
+    pair_destinations = set()
+    for line_number, row in enumerate(report_rows, start=2):
+        if row["rule"] != "fk_valid_semantic_measure_pair_swap":
+            continue
+        try:
+            original_pk = json.loads(row["primary_key"])
+            altered_key = int(row["altered_value"])
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Registro Pair Swap inválido en CSV, línea {line_number}."
+            ) from exc
+        if (
+            row["schema"] != "gold"
+            or row["table"] != "fact_area_health"
+            or row["column"] != "health_measure_key"
+            or not isinstance(original_pk, dict)
+            or original_pk.get("health_measure_key") is None
+        ):
+            raise RuntimeError(
+                f"Pair Swap fuera de la tabla/columna permitida, línea {line_number}."
+            )
+        try:
+            original_key = int(original_pk["health_measure_key"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Clave original inválida para Pair Swap, línea {line_number}."
+            ) from exc
+        if original_key != int(row["original_value"]):
+            raise RuntimeError(
+                f"El valor original del Pair Swap no coincide con su PK, línea {line_number}."
+            )
+
+        final_pk = dict(original_pk)
+        final_pk["health_measure_key"] = altered_key
+        identity = (
+            row["schema"], row["table"],
+            json.dumps(original_pk, sort_keys=True, default=str),
+        )
+        destination_identity = (
+            row["schema"], row["table"],
+            json.dumps(final_pk, sort_keys=True, default=str),
+        )
+        if identity in pair_key_map and pair_key_map[identity] != final_pk:
+            raise RuntimeError(
+                f"Una PK original tiene destinos Pair Swap contradictorios, línea {line_number}."
+            )
+        if destination_identity in pair_destinations and pair_key_map.get(identity) != final_pk:
+            raise RuntimeError(
+                f"Dos filas Pair Swap apuntan a la misma PK final, línea {line_number}."
+            )
+        pair_key_map[identity] = final_pk
+        pair_destinations.add(destination_identity)
+
     with connect(target) as conn:
         metadata = conn.execute(
             """
@@ -787,95 +958,88 @@ def recover_ground_truth(level):
 
         exported = []
         seen = set()
-        with report.open("r", newline="", encoding="utf-8-sig") as stream:
-            reader = csv.DictReader(stream)
-            required = {
-                "database", "level", "schema", "table", "primary_key",
-                "column", "original_value", "altered_value", "rule",
-                "dimension", "seed", "changed_at_utc",
-            }
-            if not required.issubset(set(reader.fieldnames or [])):
+        for line_number, row in enumerate(report_rows, start=2):
+            if row["database"] != target or row["level"] != level:
                 raise RuntimeError(
-                    f"El CSV Ground Truth no contiene las columnas requeridas: "
-                    f"{sorted(required - set(reader.fieldnames or []))}."
+                    f"El CSV no corresponde a {target}/{level}, línea {line_number}."
+                )
+            schema_name = row["schema"]
+            table_name = row["table"]
+            column_name = row["column"]
+            if schema_name not in {"silver", "gold", "datalake_control"}:
+                raise RuntimeError(
+                    f"Esquema no permitido en CSV, línea {line_number}: {schema_name!r}."
+                )
+            try:
+                primary_key = json.loads(row["primary_key"])
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"Clave primaria inválida en CSV, línea {line_number}."
+                ) from exc
+            if not isinstance(primary_key, dict) or not primary_key:
+                raise RuntimeError(
+                    f"Clave primaria vacía o inválida en CSV, línea {line_number}."
                 )
 
-            for line_number, row in enumerate(reader, start=2):
-                if row["database"] != target or row["level"] != level:
-                    raise RuntimeError(
-                        f"El CSV no corresponde a {target}/{level}, línea {line_number}."
-                    )
-                schema_name = row["schema"]
-                table_name = row["table"]
-                column_name = row["column"]
-                if schema_name not in {"silver", "gold", "datalake_control"}:
-                    raise RuntimeError(
-                        f"Esquema no permitido en CSV, línea {line_number}: {schema_name!r}."
-                    )
-                try:
-                    primary_key = json.loads(row["primary_key"])
-                except json.JSONDecodeError as exc:
-                    raise RuntimeError(
-                        f"Clave primaria inválida en CSV, línea {line_number}."
-                    ) from exc
-                if not isinstance(primary_key, dict) or not primary_key:
-                    raise RuntimeError(
-                        f"Clave primaria vacía o inválida en CSV, línea {line_number}."
-                    )
-                identity = (
-                    schema_name, table_name,
-                    json.dumps(primary_key, sort_keys=True, default=str),
-                    column_name,
+            identity = (
+                schema_name, table_name,
+                json.dumps(primary_key, sort_keys=True, default=str),
+                column_name,
+            )
+            if identity in seen:
+                raise RuntimeError(
+                    f"Cambio duplicado en CSV, línea {line_number}: {identity}."
                 )
-                if identity in seen:
-                    raise RuntimeError(
-                        f"Cambio duplicado en CSV, línea {line_number}: {identity}."
-                    )
-                seen.add(identity)
+            seen.add(identity)
 
-                where = sql.SQL(" AND ").join(
-                    sql.SQL("{} IS NOT DISTINCT FROM %s").format(sql.Identifier(key))
-                    for key in primary_key
+            row_identity = (
+                schema_name, table_name,
+                json.dumps(primary_key, sort_keys=True, default=str),
+            )
+            final_pk = pair_key_map.get(row_identity, primary_key)
+
+            where = sql.SQL(" AND ").join(
+                sql.SQL("{} IS NOT DISTINCT FROM %s").format(sql.Identifier(key))
+                for key in final_pk
+            )
+            query = sql.SQL("SELECT {} FROM {} WHERE {}").format(
+                sql.Identifier(column_name),
+                qt(schema_name, table_name),
+                where,
+            )
+            matches = conn.execute(query, list(final_pk.values())).fetchall()
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"No se pudo identificar una única celda para Ground Truth, "
+                    f"línea {line_number}: filas={len(matches)}."
                 )
-                query = sql.SQL("SELECT {} FROM {} WHERE {}").format(
-                    sql.Identifier(column_name),
-                    qt(schema_name, table_name),
-                    where,
+            if not same_exported_value(matches[0][0], row["altered_value"]):
+                raise RuntimeError(
+                    f"El valor actual no coincide con el valor alterado del CSV, "
+                    f"línea {line_number}: {schema_name}.{table_name}.{column_name}."
                 )
-                values = list(primary_key.values())
-                matches = conn.execute(query, values).fetchall()
-                if len(matches) != 1:
-                    raise RuntimeError(
-                        f"No se pudo identificar una única celda para Ground Truth, "
-                        f"línea {line_number}: filas={len(matches)}."
-                    )
-                if not same_exported_value(matches[0][0], row["altered_value"]):
-                    raise RuntimeError(
-                        f"El valor actual no coincide con el valor alterado del CSV, "
-                        f"línea {line_number}: {schema_name}.{table_name}.{column_name}."
-                    )
 
-                try:
-                    seed = int(row["seed"])
-                except (TypeError, ValueError) as exc:
-                    raise RuntimeError(
-                        f"Seed inválida en CSV, línea {line_number}."
-                    ) from exc
+            try:
+                seed = int(row["seed"])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Seed inválida en CSV, línea {line_number}."
+                ) from exc
 
-                exported.append({
-                    "database": row["database"],
-                    "level": row["level"],
-                    "schema": schema_name,
-                    "table": table_name,
-                    "primary_key": row["primary_key"],
-                    "column": column_name,
-                    "original_value": row["original_value"] or None,
-                    "altered_value": row["altered_value"] or None,
-                    "rule": row["rule"],
-                    "dimension": row["dimension"],
-                    "seed": seed,
-                    "changed_at_utc": row["changed_at_utc"],
-                })
+            exported.append({
+                "database": row["database"],
+                "level": row["level"],
+                "schema": schema_name,
+                "table": table_name,
+                "primary_key": row["primary_key"],
+                "column": column_name,
+                "original_value": row["original_value"] or None,
+                "altered_value": row["altered_value"] or None,
+                "rule": row["rule"],
+                "dimension": row["dimension"],
+                "seed": seed,
+                "changed_at_utc": row["changed_at_utc"],
+            })
 
     if not exported:
         raise RuntimeError("El CSV de cambios está vacío; no se puede recuperar Ground Truth.")
@@ -921,6 +1085,8 @@ def run(level,execute):
     print(f"OPERACIONES PLANIFICADAS: {len(changes):,}")
     print(f"CELDAS ÚNICAS A ALTERAR: {unique_cells:,}")
     for r in reports:
+        if r.get("pairs_planned") is not None:
+            print(f"  PAIR-SWAP {r['table']}.{r['column']}: {r['pairs_planned']} pares / {r['planned']} asociaciones")
         if r["status"]!="PLANNED": print(f"  {r['status']}: {r['table']}.{r['column']} — {r['reason']}")
     paths=write_reports(level,cfg,changes,reports,counts)
     print("Informes:")
