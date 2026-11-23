@@ -323,7 +323,11 @@ def read_quality_status(database: str) -> str:
     return str(row[0])
 
 
-def run_pipeline(scenarios: list[str], test_mode: bool) -> None:
+def run_pipeline(
+    scenarios: list[str],
+    test_mode: bool,
+    build_only: bool = False,
+    ) -> None:
     with acquire_master_pipeline_lock():
         states = inspect_target_databases(scenarios, test_mode)
         base_environment = os.environ.copy()
@@ -334,7 +338,7 @@ def run_pipeline(scenarios: list[str], test_mode: bool) -> None:
             scenarios, test_mode,
         )
 
-        # Landing se prepara una sola vez; es inmutable y el paso es idempotente.
+        # Landing se prepara una sola vez, inmutable e idempotente
         execute_stage(
             "Landing",
             [sys.executable, "-m", "scripts.landing.prepare_landing"],
@@ -455,7 +459,7 @@ def run_pipeline(scenarios: list[str], test_mode: bool) -> None:
                 environment,
             ))
 
-            if scenario in ("medium", "poor"):
+            if scenario in ("medium", "poor") and not build_only:
                 durations.append(execute_stage(
                     f"{scenario}/Quality Generator",
                     [
@@ -476,7 +480,11 @@ def run_pipeline(scenarios: list[str], test_mode: bool) -> None:
                 ))
 
             final_status = read_quality_status(database)
-            expected_status = "pristine" if scenario == "perfect" else "degraded"
+            expected_status = (
+                "pristine"
+                if scenario == "perfect" or build_only
+                else "degraded"
+            )
             if final_status != expected_status:
                 raise RuntimeError(
                     f"Estado de calidad final incorrecto para {scenario}: "
@@ -510,6 +518,14 @@ def main() -> int:
         "--preflight-only", action="store_true",
         help="Valida fuentes, manifiestos y estado de las bases sin modificar datos.",
     )
+    parser.add_argument(
+        "--build-only",
+        action="store_true",
+        help=(
+            "Construye Bronze, Silver y Gold sin ejecutar "
+            "el Quality Generator. Deja las bases pristine."
+        ),
+    )
     args = parser.parse_args()
     scenarios = selected_scenarios(args.scenario)
     try:
@@ -519,7 +535,11 @@ def main() -> int:
             states = inspect_target_databases(scenarios, args.test_mode)
             logger.info("Preflight aprobado | estado de bases: %s", states)
             return 0
-        run_pipeline(scenarios, args.test_mode)
+        run_pipeline(
+            scenarios,
+            args.test_mode,
+            build_only=args.build_only,
+        )
         return 0
     except Exception as exc:
         logger.exception("PIPELINE MAESTRO DETENIDO: %s", exc)

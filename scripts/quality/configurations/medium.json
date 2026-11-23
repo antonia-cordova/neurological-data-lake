@@ -1,27 +1,34 @@
-
 {
-  "seed": 20261109,
-  "rates": {
-    "accuracy": 0.05,
-    "completeness": 0.05,
-    "semantic_consistency": 0.05
-  },
-  "minimum_changes": {
-    "enabled": true,
-    "minimum_per_nonempty_table": 1
-  },
-  "integrity": {
-    "preserve_primary_keys": true,
-    "preserve_foreign_keys": true,
-    "preserve_unique_constraints": true,
-    "preserve_check_constraints": true,
-    "preserve_not_null_constraints": true
-  },
-  "audit": {
-    "preserve_etl_runs": true,
-    "generate_ground_truth": true,
-    "generate_csv_report": true
-  },
-  "scenario": "medium",
-  "frequency": "every_3_days"
+    "encryption": {
+        "enabled": true,
+        "shift": 3,
+        "targets": {
+            "gold.dim_health_measure.measure": 5,
+            "gold.dim_prevalence_type.data_value_type": 1
+        }
+    },
+    "seed": 20261109,
+    "rates": {
+        "accuracy": 0.05,
+        "completeness": 0.05,
+        "semantic_consistency": 0.05
+    },
+    "minimum_changes": {
+        "enabled": true,
+        "minimum_per_nonempty_table": 1
+    },
+    "integrity": {
+        "preserve_primary_keys": true,
+        "preserve_foreign_keys": true,
+        "preserve_unique_constraints": true,
+        "preserve_check_constraints": true,
+        "preserve_not_null_constraints": true
+    },
+    "audit": {
+        "preserve_etl_runs": true,
+        "generate_ground_truth": true,
+        "generate_csv_report": true
+    },
+    "scenario": "medium",
+    "frequency": "every_3_days"
 }

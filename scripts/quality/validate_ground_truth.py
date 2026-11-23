@@ -214,8 +214,148 @@ def read_cell(
     return "FOUND", rows[0][0]
 
 
-def audit(level: str, records: list[dict[str, Any]], test_mode: bool = False):
 
+def caesar_encrypt(value: str, shift: int = 3) -> str:
+    """Replica exacta de la transformación César del Quality Generator."""
+    if value is None:
+        raise TypeError("El cifrado César no admite valores NULL.")
+    if not isinstance(value, str):
+        raise TypeError("El cifrado César solo admite valores de texto.")
+
+    offset = shift % 26
+    result = []
+
+    for char in value:
+        if "A" <= char <= "Z":
+            result.append(chr((ord(char) - ord("A") + offset) % 26 + ord("A")))
+        elif "a" <= char <= "z":
+            result.append(chr((ord(char) - ord("a") + offset) % 26 + ord("a")))
+        else:
+            result.append(char)
+
+    return "".join(result)
+
+
+PAIR_SWAP_RULE = "fk_valid_semantic_measure_pair_swap"
+CAESAR_RULE = "deterministic_caesar_cipher"
+VALID_DIMENSIONS = {
+    "accuracy",
+    "completeness",
+    "semantic_consistency",
+    "encryption",
+}
+
+
+def pk_identity(schema: str, table: str, pk: dict[str, Any]) -> tuple:
+    """Identidad estable de una PK, independiente del orden de sus claves."""
+    return (
+        schema,
+        table,
+        json.dumps(pk, sort_keys=True, ensure_ascii=False, default=str),
+    )
+
+
+def build_pair_swap_map(records: list[dict[str, Any]]) -> dict[tuple, dict[str, Any]]:
+    """
+    Construye el mapa PK original -> PK final generado por PAIR-SWAP.
+
+    Quality Generator registra cada lado del intercambio como un cambio
+    independiente. La traducción se aplica a todos los cambios de esa fila,
+    no solo al registro que modifica health_measure_key.
+    """
+    pair_map: dict[tuple, dict[str, Any]] = {}
+    destinations: dict[tuple, tuple] = {}
+    pair_records = []
+
+    for record in records:
+        if record["rule"] != PAIR_SWAP_RULE:
+            continue
+
+        schema = record["schema"]
+        table = record["table"]
+        column = record["column"]
+        original_pk = record["_pk"]
+
+        if (
+            schema != "gold"
+            or table != "fact_area_health"
+            or column != "health_measure_key"
+        ):
+            raise ValueError(
+                "PAIR-SWAP fuera de gold.fact_area_health.health_measure_key "
+                f"(línea {record['_line']})."
+            )
+
+        if "health_measure_key" not in original_pk:
+            raise ValueError(
+                f"PAIR-SWAP sin health_measure_key en PK (línea {record['_line']})."
+            )
+
+        try:
+            original_key = int(original_pk["health_measure_key"])
+            altered_key = int(record["altered_value"])
+            logged_original = int(record["original_value"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Claves PAIR-SWAP no numéricas (línea {record['_line']})."
+            ) from exc
+
+        if original_key != logged_original:
+            raise ValueError(
+                f"El original_value no coincide con la PK (línea {record['_line']})."
+            )
+
+        if original_key == altered_key:
+            raise ValueError(
+                f"PAIR-SWAP no modifica la clave (línea {record['_line']})."
+            )
+
+        final_pk = dict(original_pk)
+        final_pk["health_measure_key"] = altered_key
+        identity = pk_identity(schema, table, original_pk)
+        destination = pk_identity(schema, table, final_pk)
+
+        if identity in pair_map and pair_map[identity] != final_pk:
+            raise ValueError(
+                f"PK original con destinos contradictorios (línea {record['_line']})."
+            )
+
+        if destination in destinations and destinations[destination] != identity:
+            raise ValueError(
+                f"Dos filas PAIR-SWAP apuntan a la misma PK final "
+                f"(línea {record['_line']})."
+            )
+
+        pair_map[identity] = final_pk
+        destinations[destination] = identity
+        pair_records.append((record, original_key, altered_key, original_pk))
+
+    # Cada asociación debe tener su contraparte recíproca.
+    by_group_and_direction = {}
+    for record, original_key, altered_key, pk in pair_records:
+        group = (
+            pk.get("source_run_id"),
+            pk.get("geography_key"),
+            pk.get("prevalence_type_key"),
+        )
+        by_group_and_direction[(group, original_key, altered_key)] = record
+
+    for record, original_key, altered_key, pk in pair_records:
+        group = (
+            pk.get("source_run_id"),
+            pk.get("geography_key"),
+            pk.get("prevalence_type_key"),
+        )
+        if (group, altered_key, original_key) not in by_group_and_direction:
+            raise ValueError(
+                "PAIR-SWAP sin contraparte recíproca "
+                f"(línea {record['_line']})."
+            )
+
+    return pair_map
+
+
+def audit(level: str, records: list[dict[str, Any]], test_mode: bool = False):
     source_db = database_for_scenario("perfect", test_mode)
     target_db = database_for_scenario(level, test_mode)
 
@@ -224,7 +364,6 @@ def audit(level: str, records: list[dict[str, Any]], test_mode: bool = False):
     duplicate_lines = set()
 
     for record in records:
-
         cell = (
             record["schema"],
             record["table"],
@@ -237,152 +376,147 @@ def audit(level: str, records: list[dict[str, Any]], test_mode: bool = False):
         else:
             first_seen[cell] = record["_line"]
 
-    with connect(source_db) as source, connect(target_db) as target:
+    # Igual que recover_ground_truth(), se construye el mapa antes de auditar
+    # cualquier registro. Así todas las columnas de una fila movida usan su PK
+    # original en Perfect y su PK final en la base degradada.
+    pair_key_map = build_pair_swap_map(records)
 
+    with connect(source_db) as source, connect(target_db) as target:
         cache = {}
 
         for record in records:
-
             schema = record["schema"]
             table = record["table"]
             column = record["column"]
-            pk = record["_pk"]
+            original_pk = record["_pk"]
             line = record["_line"]
+            dimension = record["dimension"]
+            rule = record["rule"]
 
             status = "MATCH"
             detail = ""
-
             key = (schema, table)
 
-            if line in duplicate_lines:
+            final_pk = pair_key_map.get(
+                pk_identity(schema, table, original_pk),
+                original_pk,
+            )
 
+            if line in duplicate_lines:
                 status = "DUPLICATE_LOG"
                 detail = "Celda repetida en Ground Truth."
 
-            elif record["dimension"] not in {
-                "accuracy",
-                "completeness",
-                "semantic_consistency",
-            }:
-
+            elif dimension not in VALID_DIMENSIONS:
                 status = "INVALID_DIMENSION"
-                detail = "Dimensión desconocida."
+                detail = f"Dimensión desconocida: {dimension!r}."
+
+            elif dimension == "encryption" and rule != CAESAR_RULE:
+                status = "INVALID_ENCRYPTION_RULE"
+                detail = (
+                    "La dimensión encryption solo se admite para "
+                    f"{CAESAR_RULE!r}."
+                )
+
+            elif dimension != "encryption" and rule == CAESAR_RULE:
+                status = "INVALID_ENCRYPTION_DIMENSION"
+                detail = "La regla César debe registrar dimension='encryption'."
 
             else:
-
                 if key not in cache:
-                    cache[key] = table_metadata(
-                        target,
-                        schema,
-                        table,
-                    )
+                    cache[key] = table_metadata(target, schema, table)
 
                 columns, actual_pk = cache[key]
 
                 if not columns:
-
                     status = "TABLE_NOT_FOUND"
                     detail = f"No existe {schema}.{table}."
 
                 elif column not in columns:
-
                     status = "COLUMN_NOT_FOUND"
                     detail = f"No existe {column}."
 
-                elif set(pk) != set(actual_pk):
-
+                elif set(original_pk) != set(actual_pk):
                     status = "PRIMARY_KEY_MISMATCH"
                     detail = (
-                        f"PK del log={list(pk)}; "
+                        f"PK del log={list(original_pk)}; "
                         f"PK real={actual_pk}."
                     )
 
                 else:
-
                     src_status, src_value = read_cell(
-                        source,
-                        schema,
-                        table,
-                        column,
-                        pk,
+                        source, schema, table, column, original_pk
                     )
-
                     dst_status, dst_value = read_cell(
-                        target,
-                        schema,
-                        table,
-                        column,
-                        pk,
+                        target, schema, table, column, final_pk
                     )
 
                     if src_status != "FOUND":
-
                         status = src_status
-                        detail = "Fila no encontrada en Perfect."
+                        detail = "Fila original no encontrada en Perfect."
 
                     elif dst_status != "FOUND":
-
                         status = dst_status
                         detail = (
-                            f"Fila no encontrada en {target_db}."
+                            "Fila no encontrada en la base degradada usando "
+                            f"la PK final {json.dumps(final_pk, ensure_ascii=False, default=str)}."
                         )
 
-                    elif not values_equal(
-                        src_value,
-                        record["original_value"],
-                    ):
-
+                    elif not values_equal(src_value, record["original_value"]):
                         status = "ORIGINAL_MISMATCH"
                         detail = (
                             f"Perfect={norm(src_value)!r}; "
-                            f"GT original="
-                            f"{record['original_value']!r}."
+                            f"GT original={record['original_value']!r}."
                         )
 
-                    elif record["dimension"] == "completeness":
-
+                    elif dimension == "completeness":
                         if record["altered_value"] is not None:
-
                             status = "INVALID_COMPLETENESS_LOG"
-                            detail = (
-                                "Completeness debe registrar "
-                                "altered_value null."
-                            )
-
+                            detail = "Completeness debe registrar altered_value null."
                         elif src_value is None:
-
                             status = "INVALID_COMPLETENESS_SOURCE"
-                            detail = (
-                                "El valor original en Perfect "
-                                "ya era NULL."
-                            )
-
+                            detail = "El valor original en Perfect ya era NULL."
                         elif dst_value is not None:
-
                             status = "ALTERED_MISMATCH"
                             detail = (
                                 "Se esperaba NULL; "
                                 f"se encontró {norm(dst_value)!r}."
                             )
 
+                    elif dimension == "encryption":
+                        if src_value is None:
+                            status = "INVALID_ENCRYPTION_SOURCE"
+                            detail = "No se puede cifrar un valor original NULL."
+                        elif not isinstance(src_value, str):
+                            status = "INVALID_ENCRYPTION_SOURCE"
+                            detail = "La regla César requiere un valor de texto."
+                        else:
+                            expected_cipher = caesar_encrypt(src_value, 3)
+
+                            if not values_equal(
+                                expected_cipher,
+                                record["altered_value"],
+                            ):
+                                status = "INVALID_ENCRYPTION_TRANSFORM"
+                                detail = (
+                                    f"César(+3) esperado={expected_cipher!r}; "
+                                    f"GT alterado={record['altered_value']!r}."
+                                )
+                            elif not values_equal(dst_value, expected_cipher):
+                                status = "ALTERED_MISMATCH"
+                                detail = (
+                                    f"{target_db}={norm(dst_value)!r}; "
+                                    f"César(+3) esperado={expected_cipher!r}."
+                                )
+
                     elif record["altered_value"] is None:
-
                         status = "INVALID_ALTERED_VALUE"
-                        detail = (
-                            "altered_value null fuera "
-                            "de completeness."
-                        )
+                        detail = "altered_value null fuera de completeness."
 
-                    elif not values_equal(
-                        dst_value,
-                        record["altered_value"],
-                    ):
-
+                    elif not values_equal(dst_value, record["altered_value"]):
                         status = "ALTERED_MISMATCH"
                         detail = (
                             f"{target_db}={norm(dst_value)!r}; "
-                            f"GT alterado="
-                            f"{record['altered_value']!r}."
+                            f"GT alterado={record['altered_value']!r}."
                         )
 
             results.append({
@@ -392,15 +526,17 @@ def audit(level: str, records: list[dict[str, Any]], test_mode: bool = False):
                 "schema": schema,
                 "table": table,
                 "primary_key": record["primary_key"],
+                "final_primary_key": json.dumps(
+                    final_pk, ensure_ascii=False, default=str
+                ),
                 "column": column,
-                "dimension": record["dimension"],
-                "rule": record["rule"],
+                "dimension": dimension,
+                "rule": rule,
                 "status": status,
                 "detail": detail,
             })
 
     return results
-
 
 def main():
 
@@ -461,6 +597,7 @@ def main():
         "schema",
         "table",
         "primary_key",
+        "final_primary_key",
         "column",
         "dimension",
         "rule",

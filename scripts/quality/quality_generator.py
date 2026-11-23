@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, csv, json, os, random, sys
+import argparse, csv, hashlib, json, os, random, sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -67,6 +67,23 @@ NULL_RULES = [
 ("silver","silver_acs_county_2024","estimate"),
 ("silver","silver_places_2023","data_value")]
 
+CAESAR_SHIFT = 3
+CAESAR_TARGETS = {
+    "medium": {
+        "gold.dim_health_measure.measure": 5,
+        "gold.dim_prevalence_type.data_value_type": 1,
+    },
+    "poor": {
+        "gold.dim_health_measure.measure": 9,
+        "gold.dim_prevalence_type.data_value_type": 2,
+    },
+}
+CAESAR_EXPECTED_VALUES = {
+    "gold.dim_health_measure.measure": 15,
+    "gold.dim_prevalence_type.data_value_type": 2,
+}
+CAESAR_RULE = "deterministic_caesar_cipher"
+
 PLACES_REFERENCE_YEAR = 2023
 REFERENCE_YEAR_MIN = 1900
 REFERENCE_YEAR_MAX = 2100
@@ -110,6 +127,20 @@ def load_config(level):
     if any(not isinstance(v,(int,float)) or not 0<=v<=1 for v in c["rates"].values()):
         raise ValueError(f"{p.name}: las tasas deben estar entre 0 y 1")
     if "seed" not in c: raise ValueError(f"{p.name}: falta seed")
+    encryption = c.get("encryption")
+    if not isinstance(encryption, dict):
+        raise ValueError(f"{p.name}: falta el objeto encryption.")
+    if encryption.get("enabled") is not True:
+        raise ValueError(f"{p.name}: encryption.enabled debe ser true.")
+    targets = encryption.get("targets")
+    expected_targets = CAESAR_TARGETS[level]
+    if not isinstance(targets, dict) or targets != expected_targets:
+        raise ValueError(
+            f"{p.name}: encryption.targets debe ser exactamente "
+            f"{expected_targets!r}; recibido: {targets!r}."
+        )
+    if encryption.get("shift") != CAESAR_SHIFT:
+        raise ValueError(f"{p.name}: encryption.shift debe ser {CAESAR_SHIFT}.")
     scenario = resolve_scenario()
     if c.get("scenario") != level or c.get("frequency") != SCENARIOS[level]["frequency"]:
         raise RuntimeError(f"{p.name}: escenario/frecuencia no corresponden a {level}.")
@@ -206,11 +237,146 @@ def num_new(old,kind,level,rng):
         else: new=max(Decimal(0),new)
     new=new.quantize(Decimal(".01"))
     return None if new==v else new
+def caesar_encrypt(value: str, shift: int = CAESAR_SHIFT) -> str:
+    """Cifra letras ASCII con César; conserva el resto de caracteres."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError("El cifrado César solo admite valores de texto.")
+    offset = shift % 26
+    result = []
+    for char in value:
+        if "A" <= char <= "Z":
+            result.append(chr((ord(char) - ord("A") + offset) % 26 + ord("A")))
+        elif "a" <= char <= "z":
+            result.append(chr((ord(char) - ord("a") + offset) % 26 + ord("a")))
+        else:
+            result.append(char)
+    return "".join(result)
+
+def caesar_decrypt(value: str, shift: int = CAESAR_SHIFT) -> str:
+    """Revierte caesar_encrypt usando el desplazamiento inverso."""
+    return caesar_encrypt(value, -shift)
+
+
+def plan_caesar_column(c, cfg, level, reserved, schema_name, table_name, column_name):
+    """Planifica cifrado César determinista para una columna configurada."""
+    encryption_cfg = cfg["encryption"]
+    target_key = f"{schema_name}.{table_name}.{column_name}"
+    target_count = encryption_cfg["targets"][target_key]
+    shift = encryption_cfg["shift"]
+    info = colinfo(c, schema_name, table_name)
+    report = dict(
+        table=f"{schema_name}.{table_name}", column=column_name,
+        dimension="encryption", eligible=0, target=target_count, planned=0,
+        status="PLANNED", reason="", shift=shift,
+    )
+
+    if column_name not in info:
+        report.update(status="COLUMN_MISSING", reason="Columna inexistente")
+        return [], report
+
+    pk, fks, uniques = protections(c, schema_name, table_name)
+    pk_order = pkcols(c, schema_name, table_name)
+    if not pk_order:
+        report.update(status="NO_PRIMARY_KEY", reason="Sin PK")
+        return [], report
+    if column_name in pk or column_name in fks:
+        report.update(status="PROTECTED_COLUMN", reason="La columna participa en PK o FK")
+        return [], report
+
+    selected = pk_order + [column_name]
+    rows = c.execute(sql.SQL("SELECT {} FROM {} WHERE {} IS NOT NULL ORDER BY {}").format(
+        sql.SQL(",").join(map(sql.Identifier, selected)),
+        qt(schema_name, table_name), sql.Identifier(column_name),
+        sql.SQL(",").join(map(sql.Identifier, pk_order)),
+    )).fetchall()
+
+    expected_count = CAESAR_EXPECTED_VALUES[target_key]
+    if len(rows) != expected_count:
+        raise RuntimeError(
+            f"Se esperaban {expected_count} valores no nulos en "
+            f"{target_key}, pero se encontraron {len(rows)}."
+        )
+
+    candidates = []
+    for row in rows:
+        key_values = tuple(row[:len(pk_order)])
+        original = row[len(pk_order)]
+        identity = cell_id(schema_name, table_name, pk_order, key_values, column_name)
+        if identity in reserved:
+            continue
+        altered = caesar_encrypt(original, shift)
+        if altered == original:
+            continue
+        key_payload = json.dumps(
+            dict(zip(pk_order, key_values)),
+            sort_keys=True, ensure_ascii=False, default=str,
+        )
+        # ranking no depende del nivel. Poor conserva la selección de Medium
+        rank = hashlib.sha256(
+            ("caesar-selection-v1:" + target_key + ":" + key_payload).encode("utf-8")
+        ).hexdigest()
+        candidates.append((rank, key_values, original, altered, identity))
+
+    candidates.sort(key=lambda item: item[0])
+    if len(candidates) < target_count:
+        raise RuntimeError(
+            f"No se puede cumplir el objetivo de cifrado para {target_key}: "
+            f"se requieren {target_count} valores y solo hay {len(candidates)} elegibles."
+        )
+
+    selected_candidates = candidates[:target_count]
+
+    if column_name in uniques:
+        selected_originals = {item[2] for item in selected_candidates}
+        altered_values = [item[3] for item in selected_candidates]
+        unselected_values = [
+            row[len(pk_order)] for row in rows
+            if row[len(pk_order)] not in selected_originals
+        ]
+        final_values = unselected_values + altered_values
+        if len(final_values) != len(set(final_values)):
+            raise RuntimeError(
+                f"El cifrado de {target_key} produciría una colisión UNIQUE; "
+                "no se planificarán cambios para esta columna."
+            )
+
+    changes = []
+    for _rank, key_values, original, altered, identity in selected_candidates:
+        changes.append(mkchange(
+            cfg, level, schema_name, table_name, pk_order, key_values,
+            column_name, original, altered, CAESAR_RULE, "encryption",
+        ))
+        reserved.add(identity)
+
+    report.update(eligible=len(candidates), target=target_count, planned=len(changes))
+    return changes, report
+
+
 def mkchange(cfg,level,s,t,keys,vals,col,old,new,rule,dim):
     return Change(cfg["database"],level,s,t,dict(zip(keys,vals)),col,old,new,rule,dim,
                   int(cfg["seed"]),datetime.now(timezone.utc).isoformat())
 def cell_id(s,t,keys,vals,col):
     return (s,t,tuple(vals),col)
+
+
+def _stable_payload(value):
+    """Serialización canónica para identidades deterministas."""
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str, separators=(",", ":"))
+
+
+def stable_rank(seed, namespace, identity):
+    """Ranking estable: no depende del nivel ni del orden de consulta SQL."""
+    payload = f"quality-selection-v2:{int(seed)}:{namespace}:{_stable_payload(identity)}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def stable_rng(seed, namespace, identity):
+    """RNG local a una celda/registro; no consume estado de otras reglas."""
+    payload = f"quality-transform-v2:{int(seed)}:{namespace}:{_stable_payload(identity)}"
+    digest = hashlib.sha256(payload.encode("utf-8")).digest()
+    return random.Random(int.from_bytes(digest[:8], "big"))
 
 def eligible(c,s,t,col,keys,reserved):
     names=keys+[col]
@@ -220,188 +386,124 @@ def eligible(c,s,t,col,keys,reserved):
 
 
 def plan_rule(c, cfg, level, s, t, col, kind, rate, minimum, rng, reserved):
+    """
+    Asigna propiedad de celdas de forma común a Medium y Poor.
+
+    La selección se calcula siempre sobre la severidad máxima (25 %).
+    Cada escenario aplica un prefijo de esa misma selección: Medium 5 %,
+    Poor 25 %. Las celdas reservadas para Poor no quedan disponibles para
+    que otra regla las reclame en Medium.
+
+    Para reglas numéricas, un candidato solo se admite si la transformación
+    produce un valor distinto del original en ambos niveles. 
+    """
     name = f"{s}.{t}"
     info = colinfo(c, s, t)
 
     if col not in info:
-        return [], dict(
-            table=name,
-            column=col,
-            dimension=dimension(kind),
-            eligible=0,
-            target=0,
-            planned=0,
-            status="COLUMN_MISSING",
-            reason="Columna inexistente"
-        )
+        return [], dict(table=name, column=col, dimension=dimension(kind),
+                        eligible=0, target=0, planned=0,
+                        status="COLUMN_MISSING", reason="Columna inexistente")
 
     keys, fks, uniques = protections(c, s, t)
     key_order = pkcols(c, s, t)
 
     if not key_order:
-        return [], dict(
-            table=name,
-            column=col,
-            dimension=dimension(kind),
-            eligible=0,
-            target=0,
-            planned=0,
-            status="NO_PRIMARY_KEY",
-            reason="Sin PK"
-        )
+        return [], dict(table=name, column=col, dimension=dimension(kind),
+                        eligible=0, target=0, planned=0,
+                        status="NO_PRIMARY_KEY", reason="Sin PK")
 
     if col in keys or col in uniques:
-        return [], dict(
-            table=name,
-            column=col,
-            dimension=dimension(kind),
-            eligible=0,
-            target=0,
-            planned=0,
-            status="UNIQUE_PROTECTED",
-            reason="Participa en PK/índice UNIQUE"
-        )
+        return [], dict(table=name, column=col, dimension=dimension(kind),
+                        eligible=0, target=0, planned=0,
+                        status="UNIQUE_PROTECTED", reason="Participa en PK/índice UNIQUE")
 
     if col in fks:
-        return [], dict(
-            table=name,
-            column=col,
-            dimension=dimension(kind),
-            eligible=0,
-            target=0,
-            planned=0,
-            status="FK_PROTECTED",
-            reason="Participa en FK"
-        )
+        return [], dict(table=name, column=col, dimension=dimension(kind),
+                        eligible=0, target=0, planned=0,
+                        status="FK_PROTECTED", reason="Participa en FK")
 
     if kind == "null" and info[col] != "YES":
-        return [], dict(
-            table=name,
-            column=col,
-            dimension="completeness",
-            eligible=0,
-            target=0,
-            planned=0,
-            status="NOT_NULL_PROTECTED",
-            reason="Columna NOT NULL"
-        )
+        return [], dict(table=name, column=col, dimension="completeness",
+                        eligible=0, target=0, planned=0,
+                        status="NOT_NULL_PROTECTED", reason="Columna NOT NULL")
 
-    # Obtener todas las filas elegibles, excluyendo celdas
-    # que ya fueron reservadas por otra regla.
     rows = eligible(c, s, t, col, key_order, reserved)
-
     n = len(rows)
     target = rate_count(n, rate, minimum)
+    max_target = rate_count(n, 0.25, minimum)
 
-    if not target:
-        return [], dict(
-            table=name,
-            column=col,
-            dimension=dimension(kind),
-            eligible=n,
-            target=0,
-            planned=0,
-            status="NO_ELIGIBLE_ROWS",
-            reason="Sin valores elegibles"
-        )
+    if not target and not max_target:
+        return [], dict(table=name, column=col, dimension=dimension(kind),
+                        eligible=n, target=0, planned=0,
+                        status="NO_ELIGIBLE_ROWS", reason="Sin valores elegibles")
 
-    
-    # se genera una permutación aleatoria de todas las filas.
-    # no se limita la selección inicial al número objetivo.
-    candidates = rng.sample(rows, len(rows))
+    namespace = f"{s}.{t}.{col}"
+    candidates = []
+    for row in rows:
+        vals = tuple(row[:len(key_order)])
+        old = row[len(key_order)]
+        identity = dict(zip(key_order, vals))
+        rank = stable_rank(cfg["seed"], namespace, identity)
 
-    changes = []
-
-    for r in candidates:
-
-        # detenerse cuando se alcanza el objetivo
-        if len(changes) >= target:
-            break
-
-        vals = tuple(r[:len(key_order)])
-        old = r[len(key_order)]
-
-        if kind == "null":
-            new = None
-            rule = "null_injection"
-
-        elif kind in (
-            "percent",
-            "positive",
-            "brfss",
-            "latitude",
-            "longitude"
-        ):
-            new = num_new(old, kind, level, rng)
-
-            # Si no existe un cambio válido, continuar
-            # buscando otra fila elegible
-            if new is None:
+        if kind in ("percent", "positive", "brfss", "latitude", "longitude"):
+            # La selección no depende del nivel y debe ser ejecutable en ambos.
+            medium_rng = stable_rng(cfg["seed"], f"medium:{namespace}", identity)
+            poor_rng = stable_rng(cfg["seed"], f"poor:{namespace}", identity)
+            medium_value = num_new(old, kind, "medium", medium_rng)
+            poor_value = num_new(old, kind, "poor", poor_rng)
+            if medium_value is None or poor_value is None:
                 continue
-
+            transformed = medium_value if level == "medium" else poor_value
             rule = f"numeric_{kind}"
-
+        elif kind == "null":
+            transformed = None
+            rule = "null_injection"
         else:
-            opts = [
-                x for x in kind
-                if x is not None and str(x) != str(old)
-            ]
-
+            opts = [x for x in kind if x is not None and str(x) != str(old)]
             if not opts:
                 continue
-
-            new = rng.choice(opts)
+            # la alternativa se elige de manera idéntica en ambos escenarios
+            cell_rng = stable_rng(cfg["seed"], namespace, identity)
+            transformed = cell_rng.choice(opts)
             rule = "semantic_category_swap"
 
-        changes.append(
-            mkchange(
-                cfg,
-                level,
-                s,
-                t,
-                key_order,
-                vals,
-                col,
-                old,
-                new,
-                rule,
-                dimension(kind)
-            )
+        candidates.append((rank, vals, old, transformed, identity, rule))
+
+    candidates.sort(key=lambda item: item[0])
+    if len(candidates) < max_target:
+        raise RuntimeError(
+            f"No se puede mantener la selección anidada para {name}.{col}: "
+            f"se requieren {max_target} celdas comunes (Poor), "
+            f"pero solo hay {len(candidates)} candidatas válidas en ambos niveles."
         )
 
-        # reservar únicamente las celdas que fueron modificadas
-        reserved.add(
-            cell_id(s, t, key_order, vals, col)
-        )
+    # oor define la propiedad máxima de la regla mientras que medium usa su prefijo
+    selected_max = candidates[:max_target]
+    selected_current = selected_max[:target]
+    changes = []
+    for _rank, vals, old, new, identity, rule in selected_current:
+        changes.append(mkchange(
+            cfg, level, s, t, key_order, vals, col, old, new,
+            rule, dimension(kind),
+        ))
+
+    for _rank, vals, _old, _new, _identity, _rule in selected_max:
+        reserved.add(cell_id(s, t, key_order, vals, col))
 
     planned = len(changes)
-
-    if planned == target:
-        status = "PLANNED"
-        reason = ""
-    else:
-        status = "PLANNED_PARTIAL"
-        reason = (
-            f"Objetivo: {target}; cambios válidos: {planned}; "
-            f"candidatos elegibles revisados: {n}"
-        )
-
-    return changes, dict(
-        table=name,
-        column=col,
-        dimension=dimension(kind),
-        eligible=n,
-        target=target,
-        planned=planned,
-        status=status,
-        reason=reason
+    status = "PLANNED" if planned == target else "PLANNED_PARTIAL"
+    reason = "" if status == "PLANNED" else (
+        f"Objetivo: {target}; cambios válidos: {planned}; "
+        f"candidatos elegibles revisados: {n}"
     )
+    return changes, dict(table=name, column=col, dimension=dimension(kind),
+                         eligible=n, target=target, planned=planned,
+                         status=status, reason=reason)
+
 
 def plan_places_reference_year(c, cfg, level, rate, minimum, rng, reserved):
-    """
-    Planifica inconsistencias temporales en los registros PLACES de fact_area_health.
-    Mantiene el rango CHECK 1900..2100 y excluye el año de referencia 2023.
-    """
+    """Planifica años inconsistentes con selección anidada y transformaciones aisladas."""
     rows = c.execute("""
         SELECT f.source_run_id, f.geography_key, f.health_measure_key,
                f.prevalence_type_key, f.reference_year
@@ -411,65 +513,47 @@ def plan_places_reference_year(c, cfg, level, rate, minimum, rng, reserved):
           AND f.reference_year = %s
     """, (PLACES_REFERENCE_YEAR,)).fetchall()
 
-    rows = [
-        row for row in rows
-        if ("gold", "fact_area_health",
-            (row[0], row[1], row[2], row[3]), "reference_year") not in reserved
-    ]
+    rows = [row for row in rows if (
+        "gold", "fact_area_health", (row[0], row[1], row[2], row[3]), "reference_year"
+    ) not in reserved]
     target = rate_count(len(rows), rate, minimum)
-    candidates = rng.sample(rows, len(rows))
+    rows = sorted(rows, key=lambda row: stable_rank(
+        cfg["seed"], "gold.fact_area_health.reference_year",
+        {"source_run_id": row[0], "geography_key": row[1],
+         "health_measure_key": row[2], "prevalence_type_key": row[3]},
+    ))
+
+    valid_years = [year for year in range(REFERENCE_YEAR_MIN, REFERENCE_YEAR_MAX + 1)
+                   if year != PLACES_REFERENCE_YEAR]
     changes = []
-
-    valid_years = [
-        year for year in range(REFERENCE_YEAR_MIN, REFERENCE_YEAR_MAX + 1)
-        if year != PLACES_REFERENCE_YEAR
-    ]
-
-    for row in candidates:
-        if len(changes) >= target:
-            break
-
+    for row in rows[:target]:
         run_id, geography_key, measure_key, prevalence_key, old_year = row
-        new_year = rng.choice(valid_years)
+        identity = {"source_run_id": run_id, "geography_key": geography_key,
+                    "health_measure_key": measure_key, "prevalence_type_key": prevalence_key}
+        cell_rng = stable_rng(cfg["seed"], "reference_year", identity)
+        new_year = cell_rng.choice(valid_years)
         changes.append(mkchange(
             cfg, level, "gold", "fact_area_health",
-            ["source_run_id", "geography_key", "health_measure_key",
-             "prevalence_type_key"],
+            ["source_run_id", "geography_key", "health_measure_key", "prevalence_type_key"],
             [run_id, geography_key, measure_key, prevalence_key],
             "reference_year", old_year, new_year,
-            "contextual_reference_year_mismatch", "semantic_consistency"
+            "contextual_reference_year_mismatch", "semantic_consistency",
         ))
-        reserved.add((
-            "gold", "fact_area_health",
-            (run_id, geography_key, measure_key, prevalence_key),
-            "reference_year"
-        ))
+        reserved.add(("gold", "fact_area_health",
+                      (run_id, geography_key, measure_key, prevalence_key), "reference_year"))
 
     planned = len(changes)
     status = "PLANNED" if planned == target else "PLANNED_PARTIAL"
     reason = "" if status == "PLANNED" else (
-        f"Objetivo: {target}; cambios válidos: {planned}; "
-        f"registros PLACES elegibles: {len(rows)}"
+        f"Objetivo: {target}; cambios válidos: {planned}; registros PLACES elegibles: {len(rows)}"
     )
-    return changes, dict(
-        table="gold.fact_area_health",
-        column="reference_year",
-        dimension="semantic_consistency",
-        eligible=len(rows),
-        target=target,
-        planned=planned,
-        status=status,
-        reason=reason
-    )
+    return changes, dict(table="gold.fact_area_health", column="reference_year",
+                         dimension="semantic_consistency", eligible=len(rows),
+                         target=target, planned=planned, status=status, reason=reason)
 
 
 def plan_places_health_measure_semantics(c, cfg, level, rate, minimum, rng, reserved):
-    """Planifica intercambios por pares de health_measure_key en PLACES.
-
-    Cada par pertenece al mismo (source_run_id, geography_key,
-    prevalence_type_key). Se intercambian dos claves ya existentes, por lo
-    que se conservan el conjunto de claves, las FK y la PK compuesta.
-    """
+    """Planifica parejas recíprocas con orden estable y prefijo anidado."""
     rows = c.execute("""
         SELECT f.source_run_id, f.geography_key, f.health_measure_key,
                f.prevalence_type_key
@@ -480,10 +564,8 @@ def plan_places_health_measure_semantics(c, cfg, level, rate, minimum, rng, rese
         ORDER BY f.source_run_id, f.geography_key,
                  f.prevalence_type_key, f.health_measure_key
     """).fetchall()
-
     measures = c.execute("""
-        SELECT health_measure_key
-        FROM gold.dim_health_measure
+        SELECT health_measure_key FROM gold.dim_health_measure
         ORDER BY health_measure_key
     """).fetchall()
     valid_key_set = {row[0] for row in measures}
@@ -499,110 +581,141 @@ def plan_places_health_measure_semantics(c, cfg, level, rate, minimum, rng, rese
         pk = (run_id, geography_key, measure_key, prevalence_key)
         if ("gold", "fact_area_health", pk, "health_measure_key") in reserved:
             continue
-        group = (run_id, geography_key, prevalence_key)
-        groups.setdefault(group, []).append(measure_key)
+        groups.setdefault((run_id, geography_key, prevalence_key), []).append(measure_key)
 
     eligible_rows = sum(len(keys) for keys in groups.values())
     target = rate_count(eligible_rows, rate, minimum)
-    # Un intercambio modifica exactamente dos asociaciones. Nunca se crea
-    # un objetivo impar: si el mínimo configurado produce 1, se eleva a 2.
     if target % 2:
         target += 1
     target = min(target, eligible_rows - (eligible_rows % 2))
 
-    candidates = list(groups.items())
-    rng.shuffle(candidates)
-    changes = []
-    pairs_planned = 0
+    # construir un matching determinista dentro de cada grupo. El ranking de
+    # parejas es independiente del nivel. Poor amplía el prefijo de parejas.
+    pair_candidates = []
+    for group, measure_keys in groups.items():
+        run_id, geography_key, prevalence_key = group
+        ordered_keys = sorted(
+            measure_keys,
+            key=lambda key: stable_rank(
+                cfg["seed"], "places-pair-key",
+                {"source_run_id": run_id, "geography_key": geography_key,
+                 "prevalence_type_key": prevalence_key, "health_measure_key": key},
+            ),
+        )
+        for index in range(0, len(ordered_keys) - 1, 2):
+            key_a, key_b = ordered_keys[index:index + 2]
+            identity = {"source_run_id": run_id, "geography_key": geography_key,
+                        "prevalence_type_key": prevalence_key,
+                        "measure_keys": sorted((key_a, key_b))}
+            rank = stable_rank(cfg["seed"], "places-pair", identity)
+            pair_candidates.append((rank, run_id, geography_key, prevalence_key, key_a, key_b))
 
-    for (run_id, geography_key, prevalence_key), measure_keys in candidates:
-        if len(changes) >= target:
-            break
-        available = list(measure_keys)
-        rng.shuffle(available)
-        while len(available) >= 2 and len(changes) < target:
-            key_a = available.pop()
-            key_b = available.pop()
-            if key_a == key_b:
-                continue
-            pk_a = (run_id, geography_key, key_a, prevalence_key)
-            pk_b = (run_id, geography_key, key_b, prevalence_key)
-            changes.append(mkchange(
-                cfg, level, "gold", "fact_area_health",
-                ["source_run_id", "geography_key", "health_measure_key", "prevalence_type_key"],
-                list(pk_a), "health_measure_key", key_a, key_b,
-                "fk_valid_semantic_measure_pair_swap", "semantic_consistency"
-            ))
-            changes.append(mkchange(
-                cfg, level, "gold", "fact_area_health",
-                ["source_run_id", "geography_key", "health_measure_key", "prevalence_type_key"],
-                list(pk_b), "health_measure_key", key_b, key_a,
-                "fk_valid_semantic_measure_pair_swap", "semantic_consistency"
-            ))
-            reserved.add(("gold", "fact_area_health", pk_a, "health_measure_key"))
-            reserved.add(("gold", "fact_area_health", pk_b, "health_measure_key"))
-            pairs_planned += 1
+    pair_candidates.sort(key=lambda item: item[0])
+    target_pairs = target // 2
+    selected_pairs = pair_candidates[:target_pairs]
+    changes = []
+    for _rank, run_id, geography_key, prevalence_key, key_a, key_b in selected_pairs:
+        pk_a = (run_id, geography_key, key_a, prevalence_key)
+        pk_b = (run_id, geography_key, key_b, prevalence_key)
+        changes.append(mkchange(
+            cfg, level, "gold", "fact_area_health",
+            ["source_run_id", "geography_key", "health_measure_key", "prevalence_type_key"],
+            list(pk_a), "health_measure_key", key_a, key_b,
+            "fk_valid_semantic_measure_pair_swap", "semantic_consistency",
+        ))
+        changes.append(mkchange(
+            cfg, level, "gold", "fact_area_health",
+            ["source_run_id", "geography_key", "health_measure_key", "prevalence_type_key"],
+            list(pk_b), "health_measure_key", key_b, key_a,
+            "fk_valid_semantic_measure_pair_swap", "semantic_consistency",
+        ))
+        reserved.add(("gold", "fact_area_health", pk_a, "health_measure_key"))
+        reserved.add(("gold", "fact_area_health", pk_b, "health_measure_key"))
 
     planned = len(changes)
     status = "PLANNED" if planned == target else "PLANNED_PARTIAL"
     reason = "" if status == "PLANNED" else (
         f"Objetivo: {target} asociaciones ({target // 2} pares); "
-        f"planificadas: {planned} asociaciones ({pairs_planned} pares); "
-        "no hubo suficientes pares elegibles dentro del mismo grupo"
+        f"planificadas: {planned} asociaciones ({planned // 2} pares); "
+        "no hubo suficientes parejas disjuntas elegibles"
     )
-    return changes, dict(
-        table="gold.fact_area_health",
-        column="health_measure_key",
-        dimension="semantic_consistency",
-        eligible=eligible_rows,
-        target=target,
-        planned=planned,
-        pairs_planned=pairs_planned,
-        status=status,
-        reason=reason
-    )
+    return changes, dict(table="gold.fact_area_health", column="health_measure_key",
+                         dimension="semantic_consistency", eligible=eligible_rows,
+                         target=target, planned=planned, pairs_planned=planned // 2,
+                         status=status, reason=reason)
 
 
-def plan_fk_semantics(c,cfg,level,rate,minimum,rng,reserved):
-    rows=c.execute("""SELECT f.integrated_fact_key,f.source_run_id,f.geography_key,
+def plan_fk_semantics(c, cfg, level, rate, minimum, rng, reserved):
+    rows = c.execute("""SELECT f.integrated_fact_key,f.source_run_id,f.geography_key,
     f.indicator_key,f.health_measure_key,f.prevalence_type_key,i.indicator_code,m.measure_id
     FROM gold.fact_health_integrated f
     JOIN gold.dim_health_integrated_indicator i ON i.indicator_key=f.indicator_key
     JOIN gold.dim_health_measure m ON m.health_measure_key=f.health_measure_key
     WHERE f.health_measure_key IS NOT NULL""").fetchall()
-    rows=[r for r in rows if ("gold","fact_health_integrated",(r[0],),"health_measure_key") not in reserved]
-    target=rate_count(len(rows),rate,minimum); rng.shuffle(rows); changes=[]
-    # UNIQUE key parcial es (source_run_id, geography_key, indicator_key,
-    # health_measure_key, prevalence_type_key), no incluir la PK en esta tupla
-    occupied={tuple(r) for r in c.execute("""
-    SELECT source_run_id,geography_key,indicator_key,health_measure_key,prevalence_type_key
-    FROM gold.fact_health_integrated WHERE health_measure_key IS NOT NULL
-    AND source_run_id IS NOT NULL AND geography_key IS NOT NULL
-    AND indicator_key IS NOT NULL AND prevalence_type_key IS NOT NULL""").fetchall()}
-    measures=c.execute("SELECT health_measure_key,measure_id FROM gold.dim_health_measure").fetchall()
+    rows = [r for r in rows if (
+        "gold", "fact_health_integrated", (r[0],), "health_measure_key"
+    ) not in reserved]
+    target = rate_count(len(rows), rate, minimum)
+    rows.sort(key=lambda r: stable_rank(
+        cfg["seed"], "gold.fact_health_integrated.health_measure_key",
+        {"integrated_fact_key": r[0]},
+    ))
+
+    occupied = {tuple(r) for r in c.execute("""
+        SELECT source_run_id,geography_key,indicator_key,health_measure_key,prevalence_type_key
+        FROM gold.fact_health_integrated WHERE health_measure_key IS NOT NULL
+          AND source_run_id IS NOT NULL AND geography_key IS NOT NULL
+          AND indicator_key IS NOT NULL AND prevalence_type_key IS NOT NULL
+    """).fetchall()}
+    measures = c.execute("SELECT health_measure_key,measure_id FROM gold.dim_health_measure").fetchall()
+    changes = []
+
     for r in rows:
-        if len(changes)>=target: break
-        fact,run,geo,ind,old,prev,code,measure_id=r
-        if INDICATOR_TO_MEASURE.get(code)!=measure_id: continue
-        options=measures[:]; rng.shuffle(options); selected=None
-        for new,new_id in options:
-            if new==old: continue
-            tup=(run,geo,ind,new,prev)
-            if tup not in occupied: selected=(new,new_id,tup); break
-        if selected is None: continue
-        new,new_id,tup=selected
-        occupied.discard((run,geo,ind,old,prev)); occupied.add(tup)
-        changes.append(mkchange(cfg,level,"gold","fact_health_integrated",
-            ["integrated_fact_key"],[fact],"health_measure_key",old,new,
-            "fk_valid_semantic_association_swap","semantic_consistency"))
-        reserved.add(("gold","fact_health_integrated",(fact,),"health_measure_key"))
-    status="PLANNED" if len(changes)==target else "PLANNED_PARTIAL"
-    return changes,dict(table="gold.fact_health_integrated",column="health_measure_key",
-        dimension="semantic_consistency",eligible=len(rows),target=target,planned=len(changes),
-        status=status,reason="" if status=="PLANNED" else "Alternativas insuficientes sin colisión UNIQUE")
+        if len(changes) >= target:
+            break
+        fact, run_id, geo, indicator, old, prevalence, code, measure_id = r
+        if INDICATOR_TO_MEASURE.get(code) != measure_id:
+            continue
+
+        identity = {"integrated_fact_key": fact}
+        options = list(measures)
+        options.sort(key=lambda item: stable_rank(
+            cfg["seed"], "fk-semantic-option",
+            {"integrated_fact_key": fact, "health_measure_key": item[0]},
+        ))
+        # El orden estable de opciones evita que el orden de consulta o el
+        # escenario cambien la alternativa de un registro común.
+        selected = None
+        for new_key, new_measure_id in options:
+            if new_key == old:
+                continue
+            candidate = (run_id, geo, indicator, new_key, prevalence)
+            if candidate not in occupied:
+                selected = (new_key, candidate)
+                break
+        if selected is None:
+            continue
+
+        new_key, new_tuple = selected
+        occupied.discard((run_id, geo, indicator, old, prevalence))
+        occupied.add(new_tuple)
+        changes.append(mkchange(
+            cfg, level, "gold", "fact_health_integrated", ["integrated_fact_key"],
+            [fact], "health_measure_key", old, new_key,
+            "fk_valid_semantic_association_swap", "semantic_consistency",
+        ))
+        reserved.add(("gold", "fact_health_integrated", (fact,), "health_measure_key"))
+
+    status = "PLANNED" if len(changes) == target else "PLANNED_PARTIAL"
+    return changes, dict(table="gold.fact_health_integrated", column="health_measure_key",
+                         dimension="semantic_consistency", eligible=len(rows),
+                         target=target, planned=len(changes), status=status,
+                         reason="" if status == "PLANNED" else
+                         "Alternativas insuficientes sin colisión UNIQUE")
+
 
 def build_plan(c,level,cfg):
-    rng=random.Random(int(cfg["seed"])+(1 if level=="medium" else 2))
+    rng = random.Random(int(cfg["seed"]))  # Compatibilidad de firma; selección usa stable_rank().
     rates=cfg["rates"]; minimum=int(cfg.get("minimum_changes",{}).get("minimum_per_nonempty_table",1)) if cfg.get("minimum_changes",{}).get("enabled",True) else 0
     changes=[]; reports=[]; reserved=set()
     for s,t,col,kind in NUMERIC_RULES:
@@ -612,9 +725,8 @@ def build_plan(c,level,cfg):
     a,b=plan_fk_semantics(c,cfg,level,rates["semantic_consistency"],minimum,rng,reserved); changes+=a; reports.append(b)
 
     # flujos RNG independientes
-    level_offset = 1 if level == "medium" else 2
-    year_rng = random.Random(int(cfg["seed"]) + 101 + level_offset)
-    measure_rng = random.Random(int(cfg["seed"]) + 202 + level_offset)
+    year_rng = random.Random(int(cfg["seed"]) + 101)
+    measure_rng = random.Random(int(cfg["seed"]) + 202)
 
     a,b=plan_places_reference_year(
         c,cfg,level,rates["semantic_consistency"],minimum,year_rng,reserved
@@ -622,6 +734,17 @@ def build_plan(c,level,cfg):
     a,b=plan_places_health_measure_semantics(
         c,cfg,level,rates["semantic_consistency"],minimum,measure_rng,reserved
     ); changes+=a; reports.append(b)
+
+    # cifrado determinista 
+    for schema_name, table_name, column_name in (
+        ("gold", "dim_health_measure", "measure"),
+        ("gold", "dim_prevalence_type", "data_value_type"),
+    ):
+        a, b = plan_caesar_column(
+            c, cfg, level, reserved, schema_name, table_name, column_name
+        )
+        changes += a
+        reports.append(b)
 
     for s,t,col in NULL_RULES:
         a,b=plan_rule(c,cfg,level,s,t,col,"null",rates["completeness"],minimum,rng,reserved); changes+=a; reports.append(b)
@@ -634,7 +757,7 @@ def write_reports(level,cfg,changes,reports,counts):
     out=ROOT/"quality"/"reports"; out.mkdir(parents=True,exist_ok=True)
     suffix = "_test" if cfg["database"].endswith("_test") else ""
     rulepath=out/f"quality_dry_run_rules_{level}{suffix}.csv"
-    fields=["table","column","dimension","eligible","target","planned","pairs_planned","status","reason"]
+    fields=["table","column","dimension","eligible","target","planned","pairs_planned","status","reason","shift"]
     with rulepath.open("w",newline="",encoding="utf-8-sig") as f:
         w=csv.DictWriter(f,fieldnames=fields); w.writeheader()
         for r in reports: w.writerow({k:r.get(k,"") for k in fields})
@@ -648,7 +771,7 @@ def write_reports(level,cfg,changes,reports,counts):
     with summary.open("w",newline="",encoding="utf-8-sig") as f:
         fields3=["level","database","rate_accuracy","rate_completeness","rate_semantic_consistency","tables_in_scope","source_rows_total","planned_operations","unique_cells","planned_changes_total","dimension","rules","eligible_cells","planned_changes","partial_or_skipped_rules"]
         w=csv.DictWriter(f,fieldnames=fields3); w.writeheader()
-        for dim in ("accuracy","completeness","semantic_consistency"):
+        for dim in ("accuracy","completeness","semantic_consistency","encryption"):
             subset=[r for r in reports if r["dimension"]==dim]
             w.writerow(dict(level=level,database=cfg["database"],rate_accuracy=cfg["rates"]["accuracy"],
                 rate_completeness=cfg["rates"]["completeness"],rate_semantic_consistency=cfg["rates"]["semantic_consistency"],
@@ -706,8 +829,8 @@ def _apply_fact_area_health_pair(c, pair):
             raise RuntimeError("Pair-swap: el valor original cambió desde la planificación.")
         fetched.append((change, record))
 
-    # No se omiten ni deshabilitan FK/CHECK/UNIQUE/NOT NULL. Si existen FK
-    # entrantes restrictivas, la eliminación falla y toda la transacción revierte.
+    # no se omiten ni deshabilitan FK/CHECK/UNIQUE/NOT NULL. Si existen FK
+    # entrantes restrictivas, la eliminación falla y la transacción revierte
     for change, _record in fetched:
         keys = list(change.primary_key)
         vals = tuple(change.primary_key[k] for k in keys)
@@ -719,7 +842,6 @@ def _apply_fact_area_health_pair(c, pair):
 
     for change, record in fetched:
         record["health_measure_key"] = change.altered_value
-        # Las columnas generadas siempre las calcula PostgreSQL.
         generated = c.execute("""
             SELECT column_name FROM information_schema.columns
             WHERE table_schema='gold' AND table_name='fact_area_health'
@@ -758,11 +880,6 @@ def apply_changes(c, changes):
         else:
             ordinary.append(change)
 
-    # Aplicar primero todos los cambios ordinarios. Algunos usan la PK
-    # original de fact_area_health (por ejemplo data_value y reference_year).
-    # Los pair-swaps cambian health_measure_key, que forma parte de esa PK;
-    # por eso deben ejecutarse al final, cuando ya no quedan cambios ordinarios
-    # pendientes que dependan de las claves originales.
     for x in ordinary:
         keys = list(x.primary_key)
         vals = tuple(x.primary_key[k] for k in keys)
@@ -782,9 +899,9 @@ def apply_changes(c, changes):
                 f"valor original distinto o PK no única (rowcount={result.rowcount}, esperado=1)"
             )
 
-    # Ejecutar los pair-swaps al final, después de modificar las demás columnas
+    # se ejecutan los pair-swaps al final, después de modificar las demás columnas
     # identificadas mediante la PK original. Cada pareja sigue siendo atómica
-    # dentro de la transacción global y conserva las restricciones declarativas.
+    # dentro de la transacción global y conserva sus restricciones
     for pair in pair_groups.values():
         _apply_fact_area_health_pair(c, pair)
 
@@ -884,8 +1001,7 @@ def recover_ground_truth(level):
             )
         report_rows = list(reader)
 
-    # Construir primero el mapa PK original -> PK final para todas las filas
-    # movidas por Pair Swap. El CSV contiene dos asociaciones por cada par.
+    
     pair_key_map = {}
     pair_destinations = set()
     for line_number, row in enumerate(report_rows, start=2):
@@ -1062,23 +1178,169 @@ def recover_ground_truth(level):
     )
 
 
-def run(level,execute):
+
+def _change_identity(change):
+    return (
+        change.schema,
+        change.table,
+        tuple(change.primary_key.items()),
+        change.column,
+    )
+
+
+def validate_plan_against_target(target_conn, changes):
+    """
+    Conserva la propiedad de regla definida en el universo canónico y valida
+    qué operaciones pueden aplicarse sobre la base objetivo.
+
+    Las operaciones ausentes o cuyo valor original no coincide se omiten,
+    nunca se reasignan a otra regla. Los pair-swaps se conservan únicamente
+    cuando las dos filas del par están disponibles y coinciden.
+    """
+    pair_groups = {}
+    ordinary = []
+    for change in changes:
+        if change.rule == "fk_valid_semantic_measure_pair_swap":
+            pair_key = (
+                change.schema,
+                change.table,
+                change.rule,
+                change.primary_key["source_run_id"],
+                change.primary_key["geography_key"],
+                change.primary_key["prevalence_type_key"],
+                tuple(sorted((change.original_value, change.altered_value))),
+            )
+            pair_groups.setdefault(pair_key, []).append(change)
+        else:
+            ordinary.append(change)
+
+    accepted = []
+    skipped_by_rule = {}
+
+    def target_value_matches(change):
+        keys = list(change.primary_key)
+        values = [change.primary_key[k] for k in keys]
+        where = sql.SQL(" AND ").join(
+            sql.SQL("{} IS NOT DISTINCT FROM %s").format(sql.Identifier(k))
+            for k in keys
+        )
+        query = sql.SQL("SELECT {} FROM {} WHERE {}").format(
+            sql.Identifier(change.column),
+            qt(change.schema, change.table),
+            where,
+        )
+        rows = target_conn.execute(query, values).fetchall()
+        if len(rows) != 1:
+            return False, f"fila_destino={len(rows)}"
+        if not same_exported_value(rows[0][0], change.original_value):
+            return False, "valor_original_distinto"
+        return True, ""
+
+    for change in ordinary:
+        valid, reason = target_value_matches(change)
+        if valid:
+            accepted.append(change)
+        else:
+            skipped_by_rule[change.rule] = skipped_by_rule.get(change.rule, 0) + 1
+
+    for _key, pair in pair_groups.items():
+        valid_pair = len(pair) == 2
+        if valid_pair:
+            checks = [target_value_matches(item) for item in pair]
+            valid_pair = all(item[0] for item in checks)
+        if valid_pair:
+            accepted.extend(pair)
+        else:
+            skipped_by_rule["fk_valid_semantic_measure_pair_swap"] = (
+                skipped_by_rule.get("fk_valid_semantic_measure_pair_swap", 0)
+                + len(pair)
+            )
+
+    return accepted, skipped_by_rule
+
+
+def update_reports_for_target(reports, accepted_changes, skipped_by_rule):
+    """Actualiza los totales del plan sin cambiar la propiedad de las celdas."""
+    accepted_by_rule = {}
+    for change in accepted_changes:
+        accepted_by_rule[change.rule] = accepted_by_rule.get(change.rule, 0) + 1
+
+    for report in reports:
+        original_planned = report.get("planned", 0)
+        # cada regla puede aparecer en más de una tabla, el vínculo se realiza
+        # mediante tabla/columna y reglas presentes en las operaciones aceptadas
+        table = report.get("table")
+        column = report.get("column")
+        matching = [
+            change for change in accepted_changes
+            if f"{change.schema}.{change.table}" == table
+            and change.column == column
+            and change.dimension == report.get("dimension")
+        ]
+        report["planned"] = len(matching)
+        if report["planned"] < original_planned:
+            report["status"] = "PLANNED_PARTIAL"
+            report["reason"] = (
+                (report.get("reason", "") + " | ") if report.get("reason") else ""
+            ) + (
+                f"Universo canónico: {original_planned}; "
+                f"disponibles en base objetivo: {report['planned']}. "
+                "No se reasignaron celdas."
+            )
+
+
+def run(level, execute, preflight_only=False):
     cfg=load_config(level)
     target=cfg["database"]
-    with connect(target) as c:
-        verify_scenario_metadata(c, level)
-        inv=inventory(c)
-        missing=EXPECTED-inv
+    reference_db = os.getenv("DATALAKE_REFERENCE_DB", "health_datalake")
+    if reference_db != "health_datalake":
+        raise RuntimeError(
+            "El universo canónico debe ser health_datalake (Perfect). "
+            f"DATALAKE_REFERENCE_DB recibido: {reference_db!r}."
+        )
+
+    with connect(target) as target_conn:
+        verify_scenario_metadata(target_conn, level)
+        inv = inventory(target_conn)
+        missing = EXPECTED - inv
         if missing:
-            raise RuntimeError(f"Faltan tablas: {sorted(missing)}")
-        counts={f"{s}.{t}":rowcount(c,s,t) for s,t in sorted(EXPECTED)}
-        changes,reports=build_plan(c,level,cfg)
+            raise RuntimeError(f"Faltan tablas en la base objetivo: {sorted(missing)}")
+        counts = {f"{s}.{t}": rowcount(target_conn, s, t)
+                  for s, t in sorted(EXPECTED)}
+
+        # la selección completa se construye siempre desde Perfect 
+        with connect(reference_db) as reference_conn:
+            verify_scenario_metadata(reference_conn, "perfect")
+            reference_inventory = inventory(reference_conn)
+            missing_reference = EXPECTED - reference_inventory
+            if missing_reference:
+                raise RuntimeError(
+                    "Faltan tablas en el universo canónico Perfect: "
+                    f"{sorted(missing_reference)}"
+                )
+            changes, reports = build_plan(reference_conn, level, cfg)
+
+    
+        canonical_planned = len(changes)
+        changes, unavailable = validate_plan_against_target(target_conn, changes)
+        update_reports_for_target(reports, changes, unavailable)
+        if unavailable:
+            print(
+                "OPERACIONES NO DISPONIBLES EN LA BASE OBJETIVO "
+                "(sin reasignación): "
+                + ", ".join(f"{rule}={count}" for rule, count in sorted(unavailable.items()))
+            )
 
     print(f"\n{'='*72}\n{level.upper()} | base={target} | frecuencia={cfg['frequency']}")
     print(f"Tasas: accuracy {cfg['rates']['accuracy']:.0%} | completeness {cfg['rates']['completeness']:.0%} | semantic consistency {cfg['rates']['semantic_consistency']:.0%}")
-    print(f"Tablas: {len(inv)} | Filas fuente: {sum(counts.values()):,}")
+    print(f"Universo de selección: {reference_db} (Perfect)")
+    print(f"Tablas objetivo: {len(inv)} | Filas objetivo: {sum(counts.values()):,}")
+    print(f"Operaciones canónicas seleccionadas: {canonical_planned:,}")
+    print(f"Cifrado César: +{cfg['encryption']['shift']}")
+    for target_key, target_count in cfg["encryption"]["targets"].items():
+        print(f"  {target_key}: objetivo={target_count}")
     print(f"{'DIMENSIÓN':24} {'REGLAS':>7} {'ELEGIBLES':>12} {'CAMBIOS':>10} {'OMITIDAS/PARCIALES':>20}")
-    for dim in ("accuracy","completeness","semantic_consistency"):
+    for dim in ("accuracy","completeness","semantic_consistency","encryption"):
         subset=[r for r in reports if r["dimension"]==dim]
         print(f"{dim:24} {len(subset):7d} {sum(r['eligible'] for r in subset):12,d} {sum(r['planned'] for r in subset):10,d} {sum(r['status']!='PLANNED' for r in subset):20d}")
     unique_cells=len({(x.schema,x.table,tuple(x.primary_key.items()),x.column) for x in changes})
@@ -1091,20 +1353,33 @@ def run(level,execute):
     paths=write_reports(level,cfg,changes,reports,counts)
     print("Informes:")
     for p in paths: print(f"  {p.relative_to(ROOT)}")
-    if not execute:
+    
+    if not execute and not preflight_only:
         print("DRY RUN: solo lectura. La base permanece intacta.")
         return
-    if not changes:
-        raise RuntimeError("El plan no contiene cambios; se cancela para no marcar la base como degradada.")
 
-    # preflight sobre la misma base objetivo. siempre se revierte
-    constraint_count,not_null_count=preflight_changes(target,changes)
+    if not changes:
+        raise RuntimeError(
+            "El plan no contiene cambios; se cancela la ejecución."
+        )
+
+    # preflight sobre la misma base objetivo. Se revierte.
+    constraint_count, not_null_count = preflight_changes(target, changes)
+
     print(
         f"PREFLIGHT APROBADO: {len(changes):,} operaciones; "
-        f"{constraint_count} constraints; {not_null_count} columnas NOT NULL. "
+        f"{constraint_count} constraints; "
+        f"{not_null_count} columnas NOT NULL. "
         "Transacción de prueba revertida."
     )
 
+    # modo de prueba: no continúa hacia la degradación
+    if preflight_only:
+        print(
+            f"PREFLIGHT ONLY COMPLETADO: {target}. "
+            "La base permanece intacta; no se generó Ground Truth definitivo."
+        )
+        return
     
     # La fila de metadatos se bloquea y se vuelve a validar para evitar doble ejecución
     with connect(target) as c:
@@ -1124,27 +1399,72 @@ def run(level,execute):
                 f"{not_null_count_target} columnas NOT NULL."
             )
 
-    gt=ROOT/"quality"/"ground_truth"
-    gt.mkdir(parents=True,exist_ok=True)
-    suffix = "_test" if target.endswith("_test") else ""
-    with (gt/f"ground_truth_{level}{suffix}.jsonl").open("w",encoding="utf-8") as f:
-        for x in changes:
-            f.write(json.dumps(x.row(),ensure_ascii=False)+"\n")
     print(f"BASE DEGRADADA Y VALIDADA: {target}")
+    recover_ground_truth(level)
 
 def main():
-    p=argparse.ArgumentParser(description="Quality Generator: degradación transaccional in-place y recuperación del Ground Truth.")
-    p.add_argument("--level",choices=["medium","poor"],required=True)
-    p.add_argument("--execute",action="store_true",help="Aplica el plan de degradación a la base del escenario seleccionado.")
-    p.add_argument("--recover-ground-truth",action="store_true",help="Reconstruye el JSONL desde el CSV y verifica los valores actuales; no modifica la base.")
-    a=p.parse_args()
-    if a.execute and a.recover_ground_truth:
-        p.error("--execute y --recover-ground-truth son opciones incompatibles.")
+    p = argparse.ArgumentParser(
+        description=(
+            "Quality Generator: degradación transaccional in-place "
+            "y recuperación del Ground Truth."
+        )
+    )
+
+    p.add_argument(
+        "--level",
+        choices=["medium", "poor"],
+        required=True
+    )
+
+    execution_group = p.add_mutually_exclusive_group()
+
+    execution_group.add_argument(
+        "--execute",
+        action="store_true",
+        help="Aplica definitivamente el plan de degradación."
+    )
+
+    execution_group.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help=(
+            "Ejecuta las modificaciones dentro de una transacción "
+            "y revierte siempre. No degrada la base."
+        )
+    )
+
+    p.add_argument(
+        "--recover-ground-truth",
+        action="store_true",
+        help=(
+            "Reconstruye el JSONL desde el CSV y verifica "
+            "los valores actuales; no modifica la base."
+        )
+    )
+
+    a = p.parse_args()
+
+    if a.recover_ground_truth and (
+        a.execute or a.preflight_only
+    ):
+        p.error(
+            "--recover-ground-truth es incompatible con "
+            "--execute y --preflight-only."
+        )
+
     if a.recover_ground_truth:
         recover_ground_truth(a.level)
     else:
-        run(a.level,a.execute)
-if __name__=="__main__":
-    try: main()
+        run(
+            a.level,
+            execute=a.execute,
+            preflight_only=a.preflight_only
+        )
+
+
+if __name__ == "__main__":
+    try:
+        main()
     except Exception as e:
-        print(f"ERROR: {e}",file=sys.stderr); sys.exit(1)
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
