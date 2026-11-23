@@ -392,10 +392,10 @@ def run_pipeline(
 
             
             if quality_status == "degraded":
-                # Una base degradada debe estar totalmente construida.
-                # No se permite completar Silver/Gold después de degradarla.
+                # Una base degradada debe estar totalmente construida
+                # No se permite completar Silver/Gold después de degradarla
 
-                # 1. Validar Silver: no ejecuta ETL.
+                # validar silver
                 durations.append(
                     execute_stage(
                         f"{scenario}/Validación Silver (solo lectura)",
@@ -409,7 +409,7 @@ def run_pipeline(
                     )
                 )
 
-                # 2. Recuperar y verificar Ground Truth contra PostgreSQL.
+                # verificar Ground Truth contra PostgreSQL
                 durations.append(
                     execute_stage(
                         f"{scenario}/Recuperación Ground Truth",
@@ -425,7 +425,7 @@ def run_pipeline(
                     )
                 )
 
-                # 3. Validar Gold utilizando las excepciones verificadas.
+                # validar Gold utilizando las excepciones verificadas.
                 durations.append(
                     execute_stage(
                         f"{scenario}/Validación Gold (solo lectura)",
@@ -468,8 +468,7 @@ def run_pipeline(
                     ],
                     environment,
                 ))
-                # Verifica el CSV y garantiza que el JSONL puede reconstruirse
-                # desde los cambios realmente persistidos.
+                
                 durations.append(execute_stage(
                     f"{scenario}/Validación Ground Truth",
                     [
